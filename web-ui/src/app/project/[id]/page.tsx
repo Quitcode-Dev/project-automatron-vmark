@@ -7,6 +7,7 @@ import { AppLayout } from "@/components/layout";
 import { ChatPanel } from "@/components/project/ChatPanel";
 import { IssuesBoard } from "@/components/project/IssuesBoard";
 import { PlanEditor } from "@/components/project/PlanEditor";
+import DeploymentPanel from "@/components/deployment/DeploymentPanel";
 import {
   cloneProjectLlmConfig,
   defaultProjectLlmConfig,
@@ -953,7 +954,12 @@ export default function ProjectPage() {
         )}
 
         {activeTab === "deploy" && (
-          <div className="grid h-full gap-4 xl:grid-cols-[1fr_1.1fr]">
+          <div className="h-full overflow-auto">
+            {project && <DeploymentPanel projectId={project.id} />}
+          </div>
+        )}
+        {false && (
+          <div className="grid h-full gap-4 xl:grid-cols-[1fr_1.1fr]">{/* legacy deploy form removed */}
             <div className="rounded-xl border border-border bg-card p-4">
               <div className="flex items-center justify-between gap-4">
                 <div>

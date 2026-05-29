@@ -1,1 +1,1 @@
-"""Deployment helpers for client VPS rollout."""
+"""Legacy deployment package — superseded by docker_deployment_ai."""

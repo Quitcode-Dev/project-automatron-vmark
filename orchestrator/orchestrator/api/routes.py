@@ -559,3 +559,405 @@ async def _run_preview_and_save(project_id: str, owner: str, repo: str, default_
 def _raise_for_preflight_failure(result: PreflightResult) -> None:
     if not result.ok:
         raise HTTPException(status_code=409, detail=result.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# Docker Deployment Intelligence routes (Scope 1-6)
+# ---------------------------------------------------------------------------
+
+import aiosqlite as _aiosqlite  # noqa: E402
+import orchestrator.models.project as _project_models  # noqa: E402
+from orchestrator.auth import require_auth as _require_auth  # noqa: E402
+from orchestrator.docker_deployment_ai.models import DeploymentTargetCreate  # noqa: E402
+from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: E402
+from fastapi import Depends  # noqa: E402
+
+_deployment_orch = DockerDeploymentOrchestrator()
+
+
+async def _get_deployment_db() -> _aiosqlite.Connection:
+    """Open a short-lived aiosqlite connection for deployment operations.
+
+    Reads _db_path at call-time from the module reference — NOT at import-time.
+    Importing the value directly (`from models.project import _db_path`) would
+    capture the empty string before init_db() runs.
+    """
+    db_path = _project_models._db_path
+    if not db_path:
+        raise HTTPException(
+            status_code=503,
+            detail="Database not initialized. Server startup has not completed.",
+        )
+    return await _aiosqlite.connect(db_path)
+
+
+class _DeploymentTargetRequest(BaseModel):
+    name: str
+    host: str
+    ssh_user: str
+    ssh_port: int = 22
+    environment: str = "production"
+    domain: str | None = None
+    app_name: str
+    deploy_path: str
+    preferred_strategy: str = "auto_detect"
+    auth_mode: str = "ssh_key"
+    auth_reference: str | None = None
+
+
+class _CreatePlanRequest(BaseModel):
+    target_id: str
+    repo_context: dict[str, Any] = Field(default_factory=dict)
+    desired_domain: str | None = None
+    preferred_strategy: str = "auto_detect"
+
+
+class _ApproveRequest(BaseModel):
+    approval_note: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Ownership helpers — P0-2
+# Verifies that a deployment resource belongs to an accessible project.
+# Converts 404 (project not found) to 403 so callers cannot enumerate
+# resources by guessing UUIDs.
+# ---------------------------------------------------------------------------
+
+async def _require_target_access(
+    target_id: str,
+    db: _aiosqlite.Connection,
+) -> Any:
+    """Load target and verify its project is accessible. Returns the target."""
+    from orchestrator.docker_deployment_ai.models import DeploymentTarget  # noqa: PLC0415
+    target = await _deployment_orch.get_target(target_id, db)
+    if not target:
+        raise HTTPException(status_code=404, detail="Target not found")
+    try:
+        await _get_required_project(target.project_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=403, detail="Access denied to this resource")
+        raise
+    return target
+
+
+async def _require_plan_access(
+    plan_id: str,
+    db: _aiosqlite.Connection,
+) -> dict[str, Any]:
+    """Load plan and verify its project is accessible. Returns plan data dict."""
+    plan = await _deployment_orch.get_plan(plan_id, db)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    project_id = plan.get("project_id", "")
+    try:
+        await _get_required_project(project_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=403, detail="Access denied to this resource")
+        raise
+    return plan
+
+
+async def _require_run_access(
+    run_id: str,
+    db: _aiosqlite.Connection,
+) -> dict[str, Any]:
+    """Load run and verify its project is accessible. Returns run data dict."""
+    run = await _deployment_orch.get_run(run_id, db)
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    project_id = run.get("project_id", "")
+    try:
+        await _get_required_project(project_id)
+    except HTTPException as exc:
+        if exc.status_code == 404:
+            raise HTTPException(status_code=403, detail="Access denied to this resource")
+        raise
+    return run
+
+
+# ---------------------------------------------------------------------------
+# Deployment routes
+# ---------------------------------------------------------------------------
+
+@router.post("/projects/{project_id}/deployment-targets")
+async def api_create_deployment_target(
+    project_id: str,
+    req: _DeploymentTargetRequest,
+    session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    await _get_required_project(project_id)
+    data = DeploymentTargetCreate(project_id=project_id, **req.model_dump())
+    db = await _get_deployment_db()
+    try:
+        target = await _deployment_orch.register_target(data, session.get("email"), db)
+        return target.model_dump()
+    finally:
+        await db.close()
+
+
+@router.get("/projects/{project_id}/deployment-targets")
+async def api_list_deployment_targets(
+    project_id: str,
+    _session: dict = Depends(_require_auth),
+) -> list[dict[str, Any]]:
+    await _get_required_project(project_id)
+    db = await _get_deployment_db()
+    try:
+        targets = await _deployment_orch.list_targets(project_id, db)
+        return [t.model_dump() for t in targets]
+    finally:
+        await db.close()
+
+
+@router.get("/deployment-targets/{target_id}")
+async def api_get_deployment_target(
+    target_id: str,
+    _session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    db = await _get_deployment_db()
+    try:
+        target = await _require_target_access(target_id, db)
+        return target.model_dump()
+    finally:
+        await db.close()
+
+
+@router.post("/deployment-targets/{target_id}/inventory")
+async def api_run_inventory(
+    target_id: str,
+    background_tasks: BackgroundTasks,
+    _session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    # Ownership check is synchronous and must happen before background_tasks.add_task
+    db_check = await _get_deployment_db()
+    try:
+        target = await _require_target_access(target_id, db_check)
+        project_id = target.project_id
+    finally:
+        await db_check.close()
+
+    async def _run() -> None:
+        db = await _get_deployment_db()
+        try:
+            await _deployment_orch.run_inventory(target_id, project_id, db)
+        finally:
+            await db.close()
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "target_id": target_id}
+
+
+@router.get("/deployment-targets/{target_id}/inventory/latest")
+async def api_get_latest_inventory(
+    target_id: str,
+    _session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    db = await _get_deployment_db()
+    try:
+        await _require_target_access(target_id, db)
+        snapshot = await _deployment_orch.get_latest_inventory(target_id, db)
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="No inventory snapshot found")
+        return snapshot
+    finally:
+        await db.close()
+
+
+@router.get("/deployment-targets/{target_id}/inventory/{snapshot_id}")
+async def api_get_inventory_snapshot(
+    target_id: str,
+    snapshot_id: str,
+    _session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    db = await _get_deployment_db()
+    try:
+        await _require_target_access(target_id, db)
+        snapshot = await _deployment_orch.get_inventory_snapshot(snapshot_id, db)
+        if not snapshot:
+            raise HTTPException(status_code=404, detail="Snapshot not found")
+        return snapshot
+    finally:
+        await db.close()
+
+
+@router.post("/deployment-targets/{target_id}/docker-ai/analyze")
+async def api_run_docker_ai_analysis(
+    target_id: str,
+    background_tasks: BackgroundTasks,
+    _session: dict = Depends(_require_auth),
+    analysis_type: str = "analyze_inventory",
+) -> dict[str, Any]:
+    db_check = await _get_deployment_db()
+    try:
+        target = await _require_target_access(target_id, db_check)
+        project_id = target.project_id
+    finally:
+        await db_check.close()
+
+    async def _run() -> None:
+        db = await _get_deployment_db()
+        try:
+            await _deployment_orch.run_docker_ai_analysis(target_id, project_id, analysis_type, db)
+        finally:
+            await db.close()
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "target_id": target_id, "analysis_type": analysis_type}
+
+
+@router.get("/deployment-targets/{target_id}/docker-ai/analyses")
+async def api_list_docker_ai_analyses(
+    target_id: str,
+    _session: dict = Depends(_require_auth),
+) -> list[dict[str, Any]]:
+    db = await _get_deployment_db()
+    try:
+        await _require_target_access(target_id, db)
+        return await _deployment_orch.list_docker_ai_analyses(target_id, db)
+    finally:
+        await db.close()
+
+
+@router.post("/projects/{project_id}/deployment-plans")
+async def api_create_deployment_plan(
+    project_id: str,
+    req: _CreatePlanRequest,
+    background_tasks: BackgroundTasks,
+    session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    await _get_required_project(project_id)
+
+    async def _run() -> None:
+        db = await _get_deployment_db()
+        try:
+            await _deployment_orch.create_plan(
+                project_id=project_id,
+                target_id=req.target_id,
+                repo_context=req.repo_context,
+                desired_domain=req.desired_domain,
+                preferred_strategy=req.preferred_strategy,
+                created_by=session.get("email"),
+                db=db,
+            )
+        finally:
+            await db.close()
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "project_id": project_id}
+
+
+@router.get("/deployment-plans/{plan_id}")
+async def api_get_deployment_plan(
+    plan_id: str,
+    _session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    db = await _get_deployment_db()
+    try:
+        return await _require_plan_access(plan_id, db)
+    finally:
+        await db.close()
+
+
+@router.post("/deployment-plans/{plan_id}/validate")
+async def api_validate_deployment_plan(
+    plan_id: str,
+    _session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    db = await _get_deployment_db()
+    try:
+        await _require_plan_access(plan_id, db)
+        return await _deployment_orch.validate_plan(plan_id, db)
+    finally:
+        await db.close()
+
+
+@router.post("/deployment-plans/{plan_id}/approve")
+async def api_approve_deployment_plan(
+    plan_id: str,
+    req: _ApproveRequest,
+    session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    db = await _get_deployment_db()
+    try:
+        await _require_plan_access(plan_id, db)
+        result = await _deployment_orch.approve_plan(
+            plan_id, session.get("email", "unknown"), req.approval_note, db
+        )
+        if result.get("error"):
+            raise HTTPException(status_code=409, detail=result["error"])
+        return result
+    finally:
+        await db.close()
+
+
+@router.post("/deployment-plans/{plan_id}/execute")
+async def api_execute_deployment_plan(
+    plan_id: str,
+    background_tasks: BackgroundTasks,
+    session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    db_check = await _get_deployment_db()
+    try:
+        await _require_plan_access(plan_id, db_check)
+    finally:
+        await db_check.close()
+
+    async def _run() -> None:
+        db = await _get_deployment_db()
+        try:
+            await _deployment_orch.execute_plan(plan_id, session.get("email", "unknown"), db)
+        finally:
+            await db.close()
+
+    background_tasks.add_task(_run)
+    return {"status": "started", "plan_id": plan_id}
+
+
+@router.get("/deployment-runs/{run_id}")
+async def api_get_deployment_run(
+    run_id: str,
+    _session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    db = await _get_deployment_db()
+    try:
+        return await _require_run_access(run_id, db)
+    finally:
+        await db.close()
+
+
+@router.get("/deployment-runs/{run_id}/steps")
+async def api_get_deployment_run_steps(
+    run_id: str,
+    _session: dict = Depends(_require_auth),
+) -> list[dict[str, Any]]:
+    db = await _get_deployment_db()
+    try:
+        await _require_run_access(run_id, db)
+        return await _deployment_orch.get_run_steps(run_id, db)
+    finally:
+        await db.close()
+
+
+@router.post("/deployment-runs/{run_id}/rollback")
+async def api_rollback_deployment_run(
+    run_id: str,
+    _session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    # P0-7: Rollback not implemented for MVP. Return 501 so callers get
+    # an unambiguous "not available" instead of a false-success response.
+    db = await _get_deployment_db()
+    try:
+        await _require_run_access(run_id, db)  # ownership check still enforced
+    finally:
+        await db.close()
+    raise HTTPException(
+        status_code=501,
+        detail=(
+            "Rollback is not implemented in this version. "
+            "Rollback metadata is captured but execution is disabled until "
+            "UPLOAD_FILE and WRITE_ENV_FILE actions are implemented. "
+            "See known P1 items."
+        ),
+    )

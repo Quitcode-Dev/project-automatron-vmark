@@ -24,6 +24,8 @@ dependencies = [
     "python-multipart>=0.0.9",
     "aider-chat>=0.81.0",
     "python-jose[cryptography]>=3.3.0",
+    "PyYAML>=6.0",
+    "jsonschema>=4.21.0",
 ]
 
 [project.optional-dependencies]

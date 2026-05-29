@@ -1,0 +1,93 @@
+# Docker Agent spec: compose-planner
+# Responsibility: generate or modify Docker Compose configuration compatible
+# with the detected server state, respecting existing proxy ownership.
+#
+# Safety rules (hard constraints, not guidelines):
+#   - If Traefik exists: generate labels for the existing Traefik network
+#   - If Kamal v1 exists: generate Kamal-v1-compatible or Traefik-compatible strategy
+#   - If Kamal v2 exists: do NOT generate Traefik as a replacement
+#   - If kamal-proxy exists: prefer Kamal-compatible deployment or manual_required
+#   - If Nginx/Caddy exists: do NOT bind 80/443 directly
+#   - If no proxy exists: suggest private deployment first; host-port requires approval
+#   - Never overwrite existing Docker networks, volumes, or container names
+
+name: compose-planner
+version: "1.0"
+description: >
+  Generate Docker Compose service configuration compatible with the detected
+  server state. Must respect existing reverse proxy ownership, network
+  namespacing, and port allocation. Returns generated file content or
+  explains why it cannot generate a safe Compose config.
+
+model: docker/docker-model-runner-llama3.2
+
+role: |
+  You are a Docker Compose expert. Generate safe, compatible Compose
+  service configurations that work with the existing server infrastructure.
+  You never bind ports 80/443 directly when a reverse proxy already owns
+  them. You never install a new reverse proxy if one already exists.
+  When in doubt, set strategy to manual_required.
+
+toolsets:
+  - filesystem:read
+  - docker:inspect
+
+input_schema:
+  type: object
+  required:
+    - detected_server_state
+    - app_name
+    - app_image
+  properties:
+    detected_server_state:
+      type: object
+      description: Output from reverse-proxy-detector agent
+    app_name:
+      type: string
+    app_image:
+      type: string
+    app_port:
+      type: integer
+      description: Internal application port (not host port)
+    domain:
+      type: string
+      description: Desired public domain, if any
+    existing_traefik_network:
+      type: string
+      description: Name of the existing Traefik Docker network, if detected
+    env_keys:
+      type: array
+      items:
+        type: string
+      description: Required environment variable names (no values)
+
+output_schema:
+  type: object
+  required:
+    - strategy
+    - compose_content
+  properties:
+    strategy:
+      type: string
+      enum:
+        - reuse_existing_traefik
+        - kamal_v1_compatible
+        - kamal_v2_compatible
+        - docker_compose_private
+        - docker_compose_with_host_port
+        - behind_existing_nginx
+        - behind_existing_caddy
+        - no_public_exposure
+        - manual_required
+    compose_content:
+      type: string
+      description: Generated docker-compose.yml content, or empty if manual_required
+    notes:
+      type: string
+    warnings:
+      type: array
+      items:
+        type: string
+    requires_approval:
+      type: boolean
+      description: True if host-port binding or other risk requires explicit user approval

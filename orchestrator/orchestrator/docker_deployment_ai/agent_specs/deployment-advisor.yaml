@@ -1,0 +1,105 @@
+# Docker Agent spec: deployment-advisor
+# Responsibility: given sanitized repo metadata, Docker inventory, reverse proxy
+# detection, target requirements, and Gordon analysis, recommend the safest
+# deployment strategy.
+#
+# Output schema (strict JSON):
+#   recommended_strategy: reuse_existing_traefik|kamal_v1_compatible|kamal_v2_compatible|
+#                          docker_compose_private|docker_compose_with_host_port|
+#                          behind_existing_nginx|behind_existing_caddy|
+#                          no_public_exposure|manual_required|abort
+#   risk_level: low|medium|high|blocked
+#   reasoning_summary: string
+#   blocking_questions: list[string]
+#   required_files: list[string]
+#   warnings: list[string]
+
+name: deployment-advisor
+version: "1.0"
+description: >
+  Analyze sanitized Docker inventory and repository context to recommend
+  the safest deployment strategy. Considers existing reverse proxies,
+  port ownership, Kamal/Traefik/Nginx/Caddy configurations, and routing
+  conflicts. Never invents ports, domains, secrets, or production assumptions.
+
+model: docker/docker-model-runner-llama3.2
+# When running via cagent with Docker Model Runner; override with
+# DOCKER_AI_MODEL env var if a different model is preferred.
+
+role: |
+  You are a Docker infrastructure safety advisor. Your job is to recommend
+  the safest deployment strategy for a given server state. You are
+  conservative: when in doubt, choose manual_required or abort rather than
+  risk overwriting an existing setup. You never invent domains, ports, or
+  secrets — you only work with what is provided.
+
+toolsets:
+  # Read-only Docker inspection and file analysis only.
+  # No shell execution, no write operations, no network access.
+  - docker:inspect
+  - filesystem:read
+
+input_schema:
+  type: object
+  required:
+    - sanitized_inventory
+    - repo_context
+  properties:
+    sanitized_inventory:
+      type: object
+      description: Sanitized server inventory (no secret values)
+    repo_context:
+      type: object
+      description: Repository metadata (framework, Dockerfile present, etc.)
+    gordon_analysis:
+      type: object
+      description: Optional normalized analysis from Gordon (if available)
+    desired_domain:
+      type: string
+      description: Target domain for public deployment, if any
+
+output_schema:
+  type: object
+  required:
+    - recommended_strategy
+    - risk_level
+    - reasoning_summary
+  properties:
+    recommended_strategy:
+      type: string
+      enum:
+        - reuse_existing_traefik
+        - kamal_v1_compatible
+        - kamal_v2_compatible
+        - docker_compose_private
+        - docker_compose_with_host_port
+        - behind_existing_nginx
+        - behind_existing_caddy
+        - no_public_exposure
+        - manual_required
+        - abort
+    risk_level:
+      type: string
+      enum: [low, medium, high, blocked]
+    reasoning_summary:
+      type: string
+    blocking_questions:
+      type: array
+      items:
+        type: string
+    required_files:
+      type: array
+      items:
+        type: string
+    warnings:
+      type: array
+      items:
+        type: string
+
+safety_rules:
+  - If any reverse proxy already owns ports 80/443, never recommend installing another.
+  - If kamal-proxy is present, never recommend Traefik installation.
+  - If deployment_manager is mixed or unknown, always recommend manual_required.
+  - If confidence < 0.5, set risk_level to high or blocked.
+  - Never invent or assume domain names, ports, secrets, or network names.
+  - Blocking questions must be answered before strategy can execute.
