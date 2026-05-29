@@ -184,3 +184,70 @@ class ExecutorSSHClient:
             f"docker volume create {shlex.quote(volume_name)}",
             timeout=timeout,
         )
+
+    # ------------------------------------------------------------------
+    # File-write builders — content passed via stdin, never shell-interpolated
+    # ------------------------------------------------------------------
+
+    def _run_with_stdin(
+        self, remote_cmd: str, content: str, *, timeout: int = 30
+    ) -> tuple[int, str, str]:
+        """Execute *remote_cmd* on the remote host with *content* piped to stdin.
+
+        The content is delivered via subprocess stdin, not via command
+        substitution or shell expansion — no shell metacharacters in *content*
+        can reach the remote shell.
+        """
+        full_cmd = self._ssh_prefix()
+        full_cmd.append(remote_cmd)
+        logger.debug(
+            "ExecutorSSH stdin-write [%s@%s]: %s (%d bytes)",
+            self.user, self.host, remote_cmd, len(content),
+        )
+        try:
+            result = subprocess.run(
+                full_cmd,
+                input=content,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return 1, "", f"timed out after {timeout}s"
+        except FileNotFoundError:
+            raise ExecutorSSHError("ssh binary not found — is OpenSSH installed?")
+        except OSError as exc:
+            raise ExecutorSSHError(str(exc)) from exc
+        if result.returncode != 0:
+            logger.debug(
+                "ExecutorSSH stdin-write failed (rc=%d): %s",
+                result.returncode,
+                redact(result.stderr[:500]),
+            )
+        return result.returncode, result.stdout, result.stderr
+
+    def run_upload_file(
+        self, remote_path: str, content: str, *, timeout: int = 30
+    ) -> tuple[int, str, str]:
+        """Write *content* to *remote_path* on the remote host via stdin-to-cat.
+
+        *remote_path* must have already been validated by
+        validate_path_under_deploy_dir before this method is called.
+        """
+        return self._run_with_stdin(
+            f"cat > {shlex.quote(remote_path)}", content, timeout=timeout
+        )
+
+    def run_write_env_file(
+        self, remote_path: str, content: str, *, timeout: int = 30
+    ) -> tuple[int, str, str]:
+        """Write an env-file to *remote_path* on the remote host via stdin-to-cat.
+
+        Semantically identical to run_upload_file; kept as a separate method so
+        audit logs and callers can distinguish env-file writes from generic uploads.
+        *remote_path* must have already been validated by validate_env_file_path.
+        """
+        return self._run_with_stdin(
+            f"cat > {shlex.quote(remote_path)}", content, timeout=timeout
+        )

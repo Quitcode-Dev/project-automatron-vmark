@@ -34,9 +34,12 @@ from orchestrator.docker_deployment_ai.param_validators import (
     ParameterValidationError,
     validate_compose_file,
     validate_deploy_path,
+    validate_env_file_path,
+    validate_file_content,
     validate_log_lines,
     validate_network_driver,
     validate_network_name,
+    validate_path_under_deploy_dir,
     validate_safe_name,
     validate_service_name,
     validate_volume_name,
@@ -71,10 +74,11 @@ _FORBIDDEN_ACTION_TYPES = frozenset(
     ["SHELL", "RUN_COMMAND", "EXEC", "BASH", "SH", "CUSTOM_COMMAND"]
 )
 
-# Actions that are schema-valid but not yet implemented for MVP.
-# Plans containing these actions will fail before any SSH call.
+# Actions that are schema-valid but not yet implemented for this version.
+# These are also blocked by the validator before a plan can be approved/executed.
+# Plans containing these actions WILL fail before any SSH call.
 _NOT_IMPLEMENTED_ACTIONS = frozenset(
-    ["UPLOAD_FILE", "WRITE_ENV_FILE", "DOCKER_LOGIN", "ROLLBACK_TO_PREVIOUS_RELEASE"]
+    ["DOCKER_LOGIN", "ROLLBACK_TO_PREVIOUS_RELEASE"]
 )
 
 
@@ -196,6 +200,20 @@ async def _execute_action(
         )
 
     try:
+        if atype == "UPLOAD_FILE":
+            path = validate_path_under_deploy_dir(
+                params.get("path") or "", deploy_path
+            )
+            content = validate_file_content(params.get("content") or "", "content")
+            rc, out, err = ssh.run_upload_file(path, content)
+            return out, err, (None if rc == 0 else redact(err or f"upload_file exited {rc}"))
+
+        if atype == "WRITE_ENV_FILE":
+            path = validate_env_file_path(params.get("path") or "", deploy_path)
+            content = validate_file_content(params.get("content") or "", "content")
+            rc, out, err = ssh.run_write_env_file(path, content)
+            return out, err, (None if rc == 0 else redact(err or f"write_env_file exited {rc}"))
+
         if atype == "CREATE_DIRECTORY":
             path = validate_deploy_path(params.get("path") or deploy_path)
             rc, out, err = ssh.run_mkdir(path)

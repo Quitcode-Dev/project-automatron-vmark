@@ -432,12 +432,12 @@ class TestSSHMutationMode:
             assert hasattr(ExecutorSSHClient, method), f"Missing typed builder: {method}"
 
     @pytest.mark.asyncio
-    async def test_unimplemented_action_upload_file_errors_before_ssh(self):
-        """UPLOAD_FILE must return an error and never call SSH."""
+    async def test_unimplemented_action_docker_login_errors_before_ssh(self):
+        """DOCKER_LOGIN (still not implemented) must return an error without SSH call."""
         from orchestrator.docker_deployment_ai.executor import _execute_action, ExecutorSSHClient  # noqa: PLC0415
         fake_ssh = MagicMock(spec=ExecutorSSHClient)
         _, _, error = await _execute_action(
-            {"action_type": "UPLOAD_FILE", "params": {}},
+            {"action_type": "DOCKER_LOGIN", "params": {}},
             fake_ssh,
             deploy_path="/opt/app",
         )
@@ -448,12 +448,12 @@ class TestSSHMutationMode:
             getattr(fake_ssh, method).assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_unimplemented_action_write_env_file_errors_before_ssh(self):
-        """WRITE_ENV_FILE must return an error and never call SSH."""
+    async def test_unimplemented_action_rollback_to_previous_errors_before_ssh(self):
+        """ROLLBACK_TO_PREVIOUS_RELEASE (still not implemented) must error without SSH call."""
         from orchestrator.docker_deployment_ai.executor import _execute_action, ExecutorSSHClient  # noqa: PLC0415
         fake_ssh = MagicMock(spec=ExecutorSSHClient)
         _, _, error = await _execute_action(
-            {"action_type": "WRITE_ENV_FILE", "params": {}},
+            {"action_type": "ROLLBACK_TO_PREVIOUS_RELEASE", "params": {}},
             fake_ssh,
             deploy_path="/opt/app",
         )

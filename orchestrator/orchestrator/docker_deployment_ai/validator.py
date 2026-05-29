@@ -52,6 +52,16 @@ _ALLOWED_ACTION_TYPES = frozenset(
 
 _FORBIDDEN_ACTION_TYPES = frozenset(["SHELL", "RUN_COMMAND", "EXEC", "BASH", "SH", "CUSTOM_COMMAND"])
 
+# Actions that are schema-valid and allowed by the allowlist but not yet
+# implemented by the executor. The validator blocks these BEFORE approval so
+# the user gets a clear error rather than a runtime failure after execution starts.
+#
+# Keep this list in sync with executor._NOT_IMPLEMENTED_ACTIONS.
+_EXECUTOR_NOT_IMPLEMENTED: frozenset[str] = frozenset([
+    "DOCKER_LOGIN",
+    "ROLLBACK_TO_PREVIOUS_RELEASE",
+])
+
 
 @dataclass
 class ValidationCheck:
@@ -206,6 +216,35 @@ def _check_secrets(plan: dict[str, Any]) -> ValidationCheck:
     )
 
 
+def _check_unimplemented_executor_actions(plan: dict[str, Any]) -> list[ValidationCheck]:
+    """Block plans containing action types the executor cannot yet run.
+
+    These actions are schema-valid (so they pass _check_action_types) but the
+    executor does not have working implementations for them. Blocking here gives
+    the user a clear, early error before approval or execution.
+    """
+    actions = plan.get("deployment_actions") or []
+    found: set[str] = set()
+    for action in actions:
+        atype = (action.get("action_type") or "").upper()
+        if atype in _EXECUTOR_NOT_IMPLEMENTED:
+            found.add(atype)
+    if not found:
+        return [ValidationCheck(
+            "executor_capabilities_satisfied", True,
+            "All plan actions are supported by the executor",
+        )]
+    return [
+        ValidationCheck(
+            f"executor_unimplemented:{atype}", False,
+            f"Action type '{atype}' is not yet implemented by the executor. "
+            "Remove it from the plan or wait for a version that supports it.",
+            blocking=True,
+        )
+        for atype in sorted(found)
+    ]
+
+
 def _check_policy(
     plan: dict[str, Any],
     detection: dict[str, Any],
@@ -229,8 +268,11 @@ def validate_deployment_plan(
     # 1. Schema
     all_checks.append(_check_schema(plan))
 
-    # 2. Action types
+    # 2. Action types (forbidden / unknown)
     all_checks.extend(_check_action_types(plan))
+
+    # 2b. Executor capability gate — blocks known-unimplemented actions early
+    all_checks.extend(_check_unimplemented_executor_actions(plan))
 
     # 3. Rollback
     all_checks.append(_check_rollback(plan))

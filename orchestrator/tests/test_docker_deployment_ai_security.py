@@ -219,14 +219,13 @@ class TestExecutorNotImplementedActions:
         _validate_actions([{"action_type": atype, "params": {}}])
 
     @pytest.mark.asyncio
-    async def test_upload_file_returns_error_not_acknowledged(self):
+    async def test_docker_login_returns_error_not_acknowledged(self):
+        """DOCKER_LOGIN is still not implemented — must error before any SSH call."""
         from orchestrator.docker_deployment_ai.executor import _execute_action, ExecutorSSHClient  # noqa: PLC0415
-        # We need a stub SSH client — but _execute_action never reaches SSH for NOT_IMPLEMENTED
-        # Use a MagicMock to prove SSH is never called
         from unittest.mock import MagicMock  # noqa: PLC0415
         fake_ssh = MagicMock(spec=ExecutorSSHClient)
         _, _, error = await _execute_action(
-            {"action_type": "UPLOAD_FILE", "params": {}},
+            {"action_type": "DOCKER_LOGIN", "params": {}},
             fake_ssh,
             deploy_path="/opt/app",
         )

@@ -133,3 +133,61 @@ def validate_log_lines(value: object) -> int:
     except (TypeError, ValueError):
         return 100
     return max(1, min(n, 10_000))
+
+
+_MAX_FILE_CONTENT_BYTES = 512 * 1024  # 512 KB hard cap for uploaded file content
+
+
+def validate_file_content(content: str, param_name: str = "content") -> str:
+    """Validate text file content for UPLOAD_FILE / WRITE_ENV_FILE.
+
+    The content is delivered to the remote host via subprocess stdin — it is
+    never shell-interpolated. The only constraint here is a size cap to prevent
+    very large payloads from being embedded in plan JSON.
+    """
+    if not isinstance(content, str):
+        raise ParameterValidationError(
+            f"{param_name} must be a string, got {type(content).__name__}"
+        )
+    if len(content.encode()) > _MAX_FILE_CONTENT_BYTES:
+        raise ParameterValidationError(
+            f"{param_name} exceeds maximum allowed size of "
+            f"{_MAX_FILE_CONTENT_BYTES // 1024} KB"
+        )
+    return content
+
+
+def validate_path_under_deploy_dir(path: str, deploy_path: str) -> str:
+    """Validate that *path* is within *deploy_path*.
+
+    Prevents UPLOAD_FILE / WRITE_ENV_FILE from writing outside the deploy
+    directory (e.g. /etc/cron.d or /root/.ssh/authorized_keys).
+
+    *path* must be an absolute path under *deploy_path* (not equal to it —
+    a bare directory is not a valid file destination).
+    """
+    path = validate_deploy_path(path)
+    deploy_dir = deploy_path.rstrip("/")
+    if not path.startswith(deploy_dir + "/"):
+        raise ParameterValidationError(
+            f"Upload path {path!r} is outside deploy directory {deploy_dir!r}. "
+            "Files may only be written within the deploy directory."
+        )
+    return path
+
+
+def validate_env_file_path(path: str, deploy_path: str) -> str:
+    """Validate a .env file destination path.
+
+    Extends validate_path_under_deploy_dir with a check that the basename
+    looks like an env file (starts or ends with '.env'), preventing
+    WRITE_ENV_FILE from masquerading as a generic file-write.
+    """
+    path = validate_path_under_deploy_dir(path, deploy_path)
+    basename = path.rsplit("/", 1)[-1]
+    if not (basename.startswith(".env") or basename.endswith(".env")):
+        raise ParameterValidationError(
+            f"WRITE_ENV_FILE path must be a .env file (basename starts or ends "
+            f"with '.env'), got {basename!r}"
+        )
+    return path
