@@ -424,6 +424,26 @@ class GitHubOrchestrator:
         # Read repo context
         readme = await self.gh.read_file(owner, repo, "README.md") or ""
 
+        # Pre-architect scaffolding step. If main has no package.json AND the
+        # intake / README signals Next.js, push a vendored Next.js + Tailwind +
+        # shadcn skeleton to main as a single batch of commits BEFORE the
+        # architect plans any issues. Eliminates the recurring failure mode where
+        # the architect generates an "Initialize project" task that Aider can't
+        # actually fulfil (no shell exec, only file edits) — see the root-cause
+        # plan in /Users/qc3/.claude/plans/atomic-fluttering-duckling.md.
+        from orchestrator.scaffolding import maybe_scaffold_repo
+        scaffolded = await maybe_scaffold_repo(
+            self.gh, owner, repo,
+            intake_text=project.get("intake_text") or "",
+            readme=readme,
+            log_fn=self._log,
+        )
+        if scaffolded:
+            # Re-read README so the architect sees any scaffold-added README
+            # content (currently a no-op since the fixture doesn't touch README,
+            # but keeps the contract clean for future framework adapters).
+            readme = await self.gh.read_file(owner, repo, "README.md") or readme
+
         # Auto-discover docs — scan root + docs/ folder, read all .md files up to 3 levels deep
         docs_content = ""
         docs_files_read: list[str] = []
