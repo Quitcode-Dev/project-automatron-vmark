@@ -24,6 +24,9 @@ dependencies = [
     "python-multipart>=0.0.9",
     "aider-chat>=0.81.0",
     "python-jose[cryptography]>=3.3.0",
+    # Experimental builder via Anthropic Agent SDK tool-use loop.
+    # Used by orchestrator/builder/agent_sdk.py + scripts/compare_builders.py.
+    "anthropic>=0.40.0",
 ]
 
 [project.optional-dependencies]
