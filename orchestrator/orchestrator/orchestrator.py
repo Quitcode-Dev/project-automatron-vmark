@@ -1645,8 +1645,15 @@ async def assign_to_copilot_issue(project_id: str, issue_number: int) -> dict:
     return {"assigned": 1, "issue_number": issue_number}
 
 
-async def implement_with_aider(project_id: str, issue_number: int) -> None:
-    """Clone the repo, run Aider on the issue, push a branch, open a PR."""
+async def implement_with_aider(
+    project_id: str, issue_number: int, extra_context: str | None = None,
+) -> None:
+    """Clone the repo, run Aider on the issue, push a branch, open a PR.
+
+    `extra_context`, when provided, is appended to the issue body before Aider
+    sees it. Used by the "Send to Aider" button on ERROR-level activity rows so
+    a build error / type error / runtime crash gets fed back as a fix directive.
+    """
     from orchestrator.aider_agent import implement_issue
     from orchestrator.models.project import update_github_issue_pr
 
@@ -1679,6 +1686,14 @@ async def implement_with_aider(project_id: str, issue_number: int) -> None:
             f"{'PASSED' if review.get('passed') else 'FAILED'}\n\n"
             f"{review['summary']}\n\n"
             f"Address all issues listed above in your implementation."
+        )
+
+    if extra_context:
+        issue_body += (
+            f"\n\n---\n## Additional context — surfaced from an Automatron activity error\n\n"
+            f"The user reported the following error in the activity log and asked you to fix it. "
+            f"Address it on the existing branch — do not rewrite files that aren't related.\n\n"
+            f"{extra_context}"
         )
 
     llm_cfg = await orch._llm_config()

@@ -376,6 +376,27 @@ async def api_implement_aider(
     return {"status": "started", "issue_number": str(issue_number)}
 
 
+class ReimplementWithContextRequest(BaseModel):
+    context: str = Field(..., description="The error context to feed back to Aider")
+
+
+@router.post("/projects/{project_id}/issues/{issue_number}/reimplement-with-context")
+async def api_reimplement_with_context(
+    project_id: str, issue_number: int,
+    req: ReimplementWithContextRequest, background_tasks: BackgroundTasks,
+) -> dict[str, str]:
+    """Re-run Aider on an existing issue with extra context appended to the spec.
+
+    Used by the "Send to Aider" button on ERROR-level activity rows: the row's
+    title + body + error_detail is bundled and fed back as a fix directive.
+    """
+    await _get_required_project(project_id)
+    background_tasks.add_task(
+        orch_implement_aider, project_id, issue_number, req.context,
+    )
+    return {"status": "started", "issue_number": str(issue_number)}
+
+
 class CreateIssueFromPromptRequest(BaseModel):
     prompt: str
 
@@ -542,7 +563,7 @@ async def api_restart_preview(project_id: str, background_tasks: BackgroundTasks
 
 async def _run_preview_and_save(
     project_id: str, owner: str, repo: str, default_branch: str = "main",
-    branch: str | None = None,
+    branch: str | None = None, issue_number: int | None = None,
 ) -> None:
     from orchestrator.preview import run_preview_locally
     from orchestrator.api.websocket import emit_status_update, emit_error
@@ -553,7 +574,9 @@ async def _run_preview_and_save(
     # first emit_error path) would leave the user staring at a silent UI. Always
     # surface SOMETHING.
     try:
-        preview_url = await run_preview_locally(project_id, owner, repo, default_branch, branch=branch)
+        preview_url = await run_preview_locally(
+            project_id, owner, repo, default_branch, branch=branch, issue_number=issue_number,
+        )
     except Exception as exc:
         import traceback
         tb = traceback.format_exc()
@@ -606,7 +629,7 @@ async def api_preview_issue_branch(
     # deterministic — and the issue may not even have a PR recorded yet locally.
     branch = f"aider/fix-{issue_number}"
     background_tasks.add_task(
-        _run_preview_and_save, project_id, owner, repo, default_branch, branch,
+        _run_preview_and_save, project_id, owner, repo, default_branch, branch, issue_number,
     )
     return {"status": "started", "project_id": project_id, "branch": branch}
 

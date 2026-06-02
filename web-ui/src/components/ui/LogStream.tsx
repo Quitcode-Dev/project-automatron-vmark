@@ -3,6 +3,7 @@
 import { useRef, useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
 import type { BuilderLog, BuilderStatus } from "@/lib/types";
+import { reimplementWithContext } from "@/lib/api";
 import {
   CheckCircle2,
   XCircle,
@@ -12,6 +13,7 @@ import {
   ChevronDown,
   ChevronUp,
   Zap,
+  Wrench,
 } from "lucide-react";
 
 interface LogStreamProps {
@@ -76,10 +78,42 @@ function timeAgo(timestamp: string): string {
   return `${Math.floor(diff / 3600)}h ago`;
 }
 
+// Pulls "issue #N" or "aider/fix-N" out of an activity title so the button
+// knows which issue to re-implement.
+function extractIssueNumber(text: string): number | null {
+  const m = text.match(/issue\s*#(\d+)/i) ?? text.match(/aider\/fix-(\d+)/i);
+  return m ? Number(m[1]) : null;
+}
+
 function ActivityEntry({ log }: { log: BuilderLog }) {
   const [expanded, setExpanded] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sent, setSent] = useState(false);
   const meta = STATUS_META[log.status] ?? STATUS_META.INFO;
   const hasOutput = Boolean(log.output?.trim());
+
+  const isError = log.status === "ERROR" || log.status === "BLOCKER";
+  const issueNumber = isError ? extractIssueNumber(log.task_text) : null;
+  const showSendToAider = isError && issueNumber !== null;
+
+  const handleSendToAider = async () => {
+    if (issueNumber === null || sending || sent) return;
+    setSending(true);
+    try {
+      const context = [
+        `**${log.task_text}**`,
+        log.output?.trim() ? `\n${log.output.trim()}` : "",
+        log.error_detail?.trim() ? `\n\nDetail:\n${log.error_detail.trim()}` : "",
+      ]
+        .filter(Boolean)
+        .join("");
+      await reimplementWithContext(log.project_id, issueNumber, context);
+      setSent(true);
+    } catch (err) {
+      console.error("Send to Aider failed:", err);
+      setSending(false);
+    }
+  };
 
   return (
     <div className="relative flex gap-3 pb-4 last:pb-0">
@@ -138,6 +172,34 @@ function ActivityEntry({ log }: { log: BuilderLog }) {
           <pre className="mt-1.5 whitespace-pre-wrap rounded border border-red-500/20 bg-red-500/10 px-3 py-2 text-xs text-red-400 leading-relaxed">
             {log.error_detail.slice(0, 2000)}
           </pre>
+        )}
+
+        {showSendToAider && (
+          <button
+            onClick={handleSendToAider}
+            disabled={sending || sent}
+            className={cn(
+              "mt-2 inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors",
+              sent
+                ? "border-green-500/30 bg-green-500/10 text-green-400 cursor-default"
+                : sending
+                  ? "border-border bg-muted/40 text-muted-foreground cursor-wait"
+                  : "border-amber-500/30 bg-amber-500/10 text-amber-300 hover:bg-amber-500/20",
+            )}
+          >
+            {sending ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : sent ? (
+              <CheckCircle2 className="h-3 w-3" />
+            ) : (
+              <Wrench className="h-3 w-3" />
+            )}
+            {sent
+              ? `Sent to Aider for issue #${issueNumber}`
+              : sending
+                ? "Sending…"
+                : `Send to Aider (issue #${issueNumber})`}
+          </button>
         )}
       </div>
     </div>

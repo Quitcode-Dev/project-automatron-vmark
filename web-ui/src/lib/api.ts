@@ -276,6 +276,17 @@ export async function implementWithAider(
   return request(`/api/projects/${projectId}/issues/${issueNumber}/implement`, { method: "POST" });
 }
 
+export async function reimplementWithContext(
+  projectId: string,
+  issueNumber: number,
+  context: string,
+): Promise<{ status: string }> {
+  return request(
+    `/api/projects/${projectId}/issues/${issueNumber}/reimplement-with-context`,
+    { method: "POST", body: JSON.stringify({ context }) },
+  );
+}
+
 export async function reviewPR(
   projectId: string,
   issueNumber: number,

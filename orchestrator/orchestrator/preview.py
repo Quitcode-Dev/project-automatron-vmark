@@ -135,13 +135,13 @@ def _detect_internal_port(repo_dir: Path) -> int:
 
 async def run_preview_locally(
     project_id: str, owner: str, repo: str, default_branch: str = "main",
-    branch: str | None = None,
+    branch: str | None = None, issue_number: int | None = None,
 ) -> str | None:
     """Clone the repo, build, and run it in Docker. Returns the preview URL or None.
 
     If `branch` is provided, that branch is checked out instead of `default_branch`.
-    Emits an activity_log entry at every major step so the UI shows progress
-    instead of going silent for 60-120s while the docker image builds.
+    If `issue_number` is provided, it's appended to every activity_log title so the
+    UI's "Send to Aider" button on ERROR rows can extract the right issue.
     """
     from orchestrator.models.project import save_activity_log, get_activity_logs
     from orchestrator.api.websocket import emit_error
@@ -157,8 +157,10 @@ async def run_preview_locally(
     existing = await get_activity_logs(project_id)
     _seq = [max((r.get("seq", 0) for r in existing), default=0) + 1]
 
+    _issue_suffix = f" (issue #{issue_number})" if issue_number is not None else ""
+
     async def _log(title: str, body: str = "", level: str = "INFO") -> None:
-        await save_activity_log(project_id, _seq[0], title, body, level)
+        await save_activity_log(project_id, _seq[0], f"{title}{_issue_suffix}", body, level)
         _seq[0] += 1
 
     await _log(
