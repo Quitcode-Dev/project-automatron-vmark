@@ -433,6 +433,71 @@ def _nextjs_route_url(rel_path: str) -> str | None:
     return "/" + "/".join(segments) if segments else "/"
 
 
+async def _remove_bogus_root_files(repo_dir: Path, default_branch: str) -> int:
+    """Delete repo-root files Aider created from misparsed issue-body content.
+
+    Aider's whole-edit format treats the line preceding a code fence as a
+    filename. When the issue body contains setup instructions like
+    `SUPABASE_SERVICE_ROLE_KEY=your-service-role-key` or shell command snippets
+    (`npm install`, `npm run build`) shown in code blocks, the LLM emits them
+    as file blocks and Aider writes them as literal files in the repo root.
+
+    Detects new (vs default_branch) files in the repo root whose names contain
+    characters that no real source/config file would use: `=`, whitespace,
+    `:`, `;`, or start with a shell-command prefix like `npm `, `yarn `,
+    `pnpm `, `pip `, `python `. Returns the number deleted.
+
+    Skips files in any subdirectory — only repo-root files are checked,
+    because that's where parser artifacts land. Dot-files in root (.env,
+    .gitignore, .nvmrc) are NOT skipped — those have their own validators
+    elsewhere, and a bogus file named `.env.local=secret` IS the kind of
+    artifact we want to catch.
+    """
+    # List new files added vs default_branch (so we never touch pre-existing files)
+    rc, out = await _run(
+        ["git", "diff", "--name-only", "--diff-filter=A", f"origin/{default_branch}..HEAD"],
+        cwd=repo_dir,
+    )
+    if rc != 0:
+        logger.warning("_remove_bogus_root_files: git diff failed: %s", out[-200:])
+        return 0
+
+    _SHELL_PREFIXES = ("npm ", "yarn ", "pnpm ", "pip ", "python ", "node ", "bun ", "deno ", "uvx ", "uv ", "git ", "gh ", "docker ", "supabase ")
+    _SHELL_CHARS = set("=: ;\t\n")
+
+    bogus: list[str] = []
+    for rel_raw in out.splitlines():
+        rel = rel_raw.strip()
+        if not rel:
+            continue
+        # Only repo-root files
+        if "/" in rel:
+            continue
+        name = rel
+        is_shelly = any(name.startswith(p) for p in _SHELL_PREFIXES)
+        has_bad_char = any(c in name for c in _SHELL_CHARS)
+        if is_shelly or has_bad_char:
+            bogus.append(rel)
+
+    if not bogus:
+        return 0
+
+    logger.warning("Removing %d bogus root file(s) created by Aider parser misread: %s", len(bogus), bogus)
+    rc, out = await _run(["git", "rm", "-f", "--", *bogus], cwd=repo_dir)
+    if rc != 0:
+        logger.warning("_remove_bogus_root_files: git rm failed: %s", out[-200:])
+        return 0
+    await _run(
+        ["git",
+         "-c", "user.email=automatron@automatron.local",
+         "-c", "user.name=Automatron Sanitiser",
+         "commit", "-m",
+         f"chore: remove {len(bogus)} bogus root file(s) from Aider misparse"],
+        cwd=repo_dir,
+    )
+    return len(bogus)
+
+
 async def _resolve_route_collisions(repo_dir: Path, default_branch: str) -> int:
     """Detect Next.js routes whose URL is claimed by more than one page/route file
     and delete the loser. Common after Aider tries to "move" a page into a route
@@ -826,6 +891,17 @@ async def _implement_issue_locked(
         f"Implement the task described above. Follow all implementation notes and "
         f"acceptance criteria exactly. Write complete, working file contents for every "
         f"file you create or modify.{scratch_note}{reimpl_note}{preserve_note}"
+        f"\n\nSHELL COMMANDS AND ENV-VAR ASSIGNMENTS ARE NEVER FILENAMES. "
+        f"The issue body may show shell commands inside code fences "
+        f"(```\\nnpm install\\n```) or env-var examples "
+        f"(```\\nSUPABASE_URL=https://...\\n```) as part of setup instructions. "
+        f"These are NOT files to create — they are documentation. "
+        f"A real filename always ends in a file extension (`.tsx`, `.ts`, `.js`, "
+        f"`.json`, `.md`, `.css`, `.mjs`, `.cjs`, `.yml`, `.yaml`, `.toml`, `.sql`, "
+        f"`.env`, `.gitignore`, or similar) or matches a known config-root name "
+        f"(`Dockerfile`, `Makefile`, `LICENSE`, `README`). If you see a line like "
+        f"`npm run build` or `KEY=value` preceding a code block, treat it as the "
+        f"START of a command/env example, NOT a filename."
     )
 
     env = {**os.environ}
@@ -963,6 +1039,15 @@ async def _implement_issue_locked(
     collisions = await _resolve_route_collisions(repo_dir, default_branch)
     if collisions:
         logger.info("Aider: resolved %d Next.js route collision file(s) for issue #%d", collisions, issue_number)
+
+    # Catch Aider's whole-edit parser misreads: when the issue body contains
+    # setup instructions like `npm install` or `SUPABASE_*=value` in code blocks,
+    # Aider writes them as files in the repo root. Reviewer flagged these
+    # as "spurious files committed to repository root" — this is the structural
+    # fix.
+    bogus = await _remove_bogus_root_files(repo_dir, default_branch)
+    if bogus:
+        logger.info("Aider: removed %d bogus root file(s) from parser misread for issue #%d", bogus, issue_number)
 
     # Fill any files that Aider missed due to output-token limit (whole-mode truncation).
     # Two sources of "missing": (a) files declared in the issue body's file_paths, and
@@ -1111,6 +1196,12 @@ async def _implement_issue_locked(
             logger.info(
                 "Aider: post-retry resolved %d route collision file(s) for issue #%d",
                 retry_collisions, issue_number,
+            )
+        retry_bogus = await _remove_bogus_root_files(repo_dir, default_branch)
+        if retry_bogus:
+            logger.info(
+                "Aider: post-retry removed %d bogus root file(s) for issue #%d",
+                retry_bogus, issue_number,
             )
 
         build_passed2, build_output2 = await run_build_in_docker(repo_dir)
