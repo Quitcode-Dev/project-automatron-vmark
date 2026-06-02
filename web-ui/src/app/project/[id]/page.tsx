@@ -651,63 +651,98 @@ export default function ProjectPage() {
 
               <div className="mt-4 space-y-4">
                 {(["architect", "builder", "reviewer"] as const).map((role) => (
-                  <div key={role} className="grid gap-3 md:grid-cols-[96px_1fr_1.2fr]">
-                    <div className="self-center text-sm font-medium capitalize">{role}</div>
+                  <div key={role} className="space-y-2">
+                    <div className="grid gap-3 md:grid-cols-[96px_1fr_1.2fr]">
+                      <div className="self-center text-sm font-medium capitalize">{role}</div>
 
-                    <label className="space-y-1 text-sm">
-                      <span className="text-muted-foreground">Provider</span>
-                      <select
-                        value={llmConfig[role].provider}
-                        disabled={isRunning}
-                        onChange={(event) => {
-                          const provider = event.target.value as LlmProvider;
-                          void updateRoleProvider(role, provider);
-                        }}
+                      <label className="space-y-1 text-sm">
+                        <span className="text-muted-foreground">Provider</span>
+                        <select
+                          value={llmConfig[role].provider}
+                          disabled={isRunning}
+                          onChange={(event) => {
+                            const provider = event.target.value as LlmProvider;
+                            void updateRoleProvider(role, provider);
+                          }}
+                          className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+                        >
+                          {llmProviders.map((provider) => (
+                            <option key={provider.value} value={provider.value}>
+                              {provider.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label className="space-y-1 text-sm">
+                        <span className="text-muted-foreground">Model</span>
+                        <select
+                          value={llmConfig[role].model}
+                          disabled={isRunning}
+                          onChange={(event) =>
+                            setLlmConfig((current) => ({
+                              ...current,
+                              [role]: {
+                                ...current[role],
+                              model: event.target.value,
+                            },
+                          }))
+                        }
                         className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
                       >
-                        {llmProviders.map((provider) => (
-                          <option key={provider.value} value={provider.value}>
-                            {provider.label}
+                          <option value="">
+                            {loadingProviders[llmConfig[role].provider]
+                              ? "Loading models..."
+                              : modelOptionsFor(llmConfig[role].provider).length > 0
+                              ? "Select model"
+                              : "No models available"}
                           </option>
-                        ))}
-                      </select>
-                    </label>
+                          {modelOptionsFor(llmConfig[role].provider).map((model) => (
+                            <option key={model.id} value={model.id}>
+                              {model.label}
+                            </option>
+                          ))}
+                        </select>
+                        {providerCatalogs[llmConfig[role].provider]?.error && (
+                          <p className="text-xs text-amber-500">
+                            {providerCatalogs[llmConfig[role].provider]?.error}
+                          </p>
+                        )}
+                      </label>
+                    </div>
 
-                    <label className="space-y-1 text-sm">
-                      <span className="text-muted-foreground">Model</span>
-                      <select
-                        value={llmConfig[role].model}
-                        disabled={isRunning}
-                        onChange={(event) =>
-                          setLlmConfig((current) => ({
-                            ...current,
-                            [role]: {
-                              ...current[role],
-                            model: event.target.value,
-                          },
-                        }))
-                      }
-                      className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
-                    >
-                        <option value="">
-                          {loadingProviders[llmConfig[role].provider]
-                            ? "Loading models..."
-                            : modelOptionsFor(llmConfig[role].provider).length > 0
-                            ? "Select model"
-                            : "No models available"}
-                        </option>
-                        {modelOptionsFor(llmConfig[role].provider).map((model) => (
-                          <option key={model.id} value={model.id}>
-                            {model.label}
-                          </option>
-                        ))}
-                      </select>
-                      {providerCatalogs[llmConfig[role].provider]?.error && (
-                        <p className="text-xs text-amber-500">
-                          {providerCatalogs[llmConfig[role].provider]?.error}
-                        </p>
-                      )}
-                    </label>
+                    {role === "builder" && (
+                      <div className="grid gap-3 md:grid-cols-[96px_1fr_1.2fr]">
+                        <div />
+                        <label className="space-y-1 text-sm md:col-span-2">
+                          <span className="text-muted-foreground">Engine</span>
+                          <select
+                            value={llmConfig.builder.engine ?? "aider"}
+                            disabled={isRunning}
+                            onChange={(event) =>
+                              setLlmConfig((current) => ({
+                                ...current,
+                                builder: {
+                                  ...current.builder,
+                                  engine: event.target.value as "aider" | "agent_sdk",
+                                },
+                              }))
+                            }
+                            className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+                          >
+                            <option value="aider">Aider (subprocess, default)</option>
+                            <option value="agent_sdk">
+                              Agent SDK (Anthropic tool-loop — experimental, ~5× cheaper)
+                            </option>
+                          </select>
+                          <p className="text-xs text-muted-foreground">
+                            Anthropic Agent SDK uses prompt caching and tool-use for
+                            cheaper, cleaner runs. Push goes to <code>agent-sdk/fix-N</code>{" "}
+                            instead of <code>aider/fix-N</code>. Anthropic models only.
+                          </p>
+                        </label>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>

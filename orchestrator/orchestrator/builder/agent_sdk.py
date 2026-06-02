@@ -478,6 +478,14 @@ async def implement_issue_via_agent_sdk(
     messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
     usage = UsageTotals()
     done_summary: str | None = None
+    # Track whether the agent actually made any modifications. Used to reject
+    # premature done calls — the agent must call write_file / edit_file /
+    # delete_file at least once before done is honoured. Without this guard the
+    # agent can call done after pure exploration (we observed this on issue #49
+    # which was already merged — agent read 24 files, ran build, called done,
+    # produced zero changes).
+    _WRITE_TOOLS = {"write_file", "edit_file", "delete_file"}
+    write_tool_calls = 0
 
     for iteration in range(max_iterations):
         usage.iterations += 1
@@ -514,7 +522,27 @@ async def implement_issue_via_agent_sdk(
                 continue
             usage.tool_calls += 1
             usage.tool_call_breakdown[block.name] = usage.tool_call_breakdown.get(block.name, 0) + 1
+            if block.name in _WRITE_TOOLS:
+                write_tool_calls += 1
             if block.name == "done":
+                # Reject premature done: the agent must have made at least one
+                # write/edit/delete before completion. Surface the rejection as
+                # a tool result so the loop continues and the model can correct.
+                if write_tool_calls == 0:
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": (
+                            "REJECTED: you called done without making any changes "
+                            "(no write_file, edit_file, or delete_file calls). "
+                            "Re-read the issue's implementation_notes and "
+                            "acceptance_criteria, then USE THE TOOLS to make the "
+                            "changes the spec requires. Calling done again without "
+                            "first writing code will be rejected again."
+                        ),
+                        "is_error": True,
+                    })
+                    continue
                 done_summary = block.input.get("summary", "(no summary)")
                 tool_results.append({
                     "type": "tool_result",
@@ -540,14 +568,44 @@ async def implement_issue_via_agent_sdk(
     else:
         return None, f"agent exceeded max_iterations ({max_iterations})", usage
 
-    # Commit + push whatever the agent changed
-    await _run(
-        ["git",
-         "-c", "user.email=agent@automatron.local",
-         "-c", "user.name=Automatron Agent SDK",
-         "add", "-A"],
-        cwd=repo_dir,
-    )
+    # Skip commit + push if the only diff vs default_branch is build artifacts.
+    # Running `next build` / `npm install` inside run_build regenerates
+    # next-env.d.ts, package-lock.json, .next/, etc. If those are the ONLY
+    # changes (because the agent did exploration + build but no real edits),
+    # committing them creates a misleading branch that suggests progress when
+    # there was none. Return early so the caller sees no branch was created.
+    _BUILD_ARTIFACTS = {
+        "next-env.d.ts", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
+        "bun.lockb", "tsconfig.tsbuildinfo",
+    }
+    _, status_out = await _run(["git", "status", "--porcelain"], cwd=repo_dir)
+    changed_paths: list[str] = []
+    for line in status_out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # `git status --porcelain` format: "XY path" where XY is the status code
+        # (e.g. " M", "??"). Path can contain spaces. Split on first run of spaces.
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            changed_paths.append(parts[1])
+    meaningful = [p for p in changed_paths if p not in _BUILD_ARTIFACTS and not p.startswith(".next/")]
+    if not meaningful:
+        logger.warning(
+            "Agent SDK: only build artifacts changed for issue #%d — skipping commit/push. Artifacts: %s",
+            issue_number, changed_paths,
+        )
+        return None, (
+            f"Agent called done but only build artifacts changed: {changed_paths}. "
+            f"No real code was written. The spec may already be implemented on the base branch, "
+            f"or the agent prematurely declared completion."
+        ), usage
+
+    # Commit + push whatever the agent changed (excluding build artifacts via
+    # selective add — `git add` only meaningful paths, leave artifacts dirty).
+    rc, _ = await _run(["git", "add", "--", *meaningful], cwd=repo_dir)
+    if rc != 0:
+        return None, f"git add failed for paths: {meaningful}", usage
     rc, out = await _run(
         ["git",
          "-c", "user.email=agent@automatron.local",

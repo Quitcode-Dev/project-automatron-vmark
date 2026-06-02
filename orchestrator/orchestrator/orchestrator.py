@@ -1729,36 +1729,67 @@ async def implement_with_aider(
         )
 
     llm_cfg = await orch._llm_config()
-    model = llm_cfg.get("builder", {}).get("model", "anthropic/claude-sonnet-4-6")
+    builder_cfg = llm_cfg.get("builder", {}) or {}
+    model = builder_cfg.get("model", "anthropic/claude-sonnet-4-6")
+    engine = (builder_cfg.get("engine") or "aider").strip().lower()
     # Remove internal claude/ prefix if present; keep anthropic/ for LiteLLM routing
     model = model.replace("claude/", "")
     # Validate model — fall back if it looks like a hallucinated or unrecognized name
     _KNOWN_PREFIXES = ("anthropic/", "claude-", "gpt-4", "gpt-4o", "openai/", "gemini", "deepseek")
     _is_gpt = model.startswith(("gpt-", "openai/"))
     if not any(model.startswith(p) for p in _KNOWN_PREFIXES) or (_is_gpt and not settings.openai_api_key):
-        logger.warning("Aider: unrecognized or unconfigured model %r — falling back to claude-sonnet-4-6", model)
+        logger.warning("Builder: unrecognized or unconfigured model %r — falling back to claude-sonnet-4-6", model)
         model = "anthropic/claude-sonnet-4-6"
 
     is_reimplementation = bool(existing_pr_number)
     action = "re-implementing" if is_reimplementation else "starting"
-    await orch._log(f"Aider {action} on #{issue_number}", issue_title, "RUNNING")
+    engine_label = "Aider" if engine == "aider" else "Agent SDK"
+    await orch._log(f"{engine_label} {action} on #{issue_number}", issue_title, "RUNNING")
 
-    # Set "implementing" status immediately so the UI shows "Working…" while Aider runs
+    # Set "implementing" status immediately so the UI shows "Working…" while the builder runs
     from orchestrator.models.project import update_github_issue_status, list_github_issues as _list_issues
     await update_github_issue_status(project_id, issue_number, "implementing")
     await emit_issues_updated(project_id, await _list_issues(project_id))
 
-    branch, failure_reason = await implement_issue(
-        project_id=project_id,
-        owner=owner,
-        repo=repo,
-        issue_number=issue_number,
-        issue_title=issue_title,
-        issue_body=issue_body,
-        default_branch=default_branch,
-        model=model,
-        is_reimplementation=is_reimplementation,
-    )
+    if engine == "agent_sdk":
+        from orchestrator.builder.agent_sdk import implement_issue_via_agent_sdk
+        # Agent SDK takes the raw model name (no LiteLLM "anthropic/" prefix).
+        sdk_model = model.removeprefix("anthropic/")
+        branch, failure_reason, usage = await implement_issue_via_agent_sdk(
+            project_id=project_id,
+            owner=owner,
+            repo=repo,
+            issue_number=issue_number,
+            issue_title=issue_title,
+            issue_body=issue_body,
+            default_branch=default_branch,
+            model=sdk_model,
+            is_reimplementation=is_reimplementation,
+            extra_context=None,  # already prepended above for both engines
+        )
+        # Surface cost in activity log so the UI shows the cheaper engine's wins.
+        await orch._log(
+            f"Agent SDK done for #{issue_number}",
+            (
+                f"iterations={usage.iterations} • tool_calls={usage.tool_calls} • "
+                f"in={usage.input_tokens} • out={usage.output_tokens} • "
+                f"cache_r={usage.cache_read_input_tokens} • cache_w={usage.cache_creation_input_tokens} • "
+                f"~${usage.estimated_cost_usd(model):.4f}"
+            ),
+            "INFO" if branch else "AMBIGUITY",
+        )
+    else:
+        branch, failure_reason = await implement_issue(
+            project_id=project_id,
+            owner=owner,
+            repo=repo,
+            issue_number=issue_number,
+            issue_title=issue_title,
+            issue_body=issue_body,
+            default_branch=default_branch,
+            model=model,
+            is_reimplementation=is_reimplementation,
+        )
 
     if not branch:
         detail = failure_reason or "unknown error"
