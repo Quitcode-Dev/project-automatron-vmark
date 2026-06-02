@@ -185,8 +185,11 @@ async def run_preview_locally(
         from orchestrator.api.websocket import emit_error
         await emit_error(
             project_id,
-            f"Preview cannot start: no package.json on branch `{target_branch}` yet. "
-            "Pick a branch that contains the project init (or merge the init PR).",
+            f"Preview cannot start: no package.json on `{target_branch}`. "
+            f"Aider branches are `main + this-issue's-diff` — when the project-init issue "
+            f"(the one that creates package.json) hasn't been merged to main yet, none of "
+            f"the later feature branches carry it either. Implement & merge the init issue first, "
+            f"then every aider/fix-N preview will compose on top of it.",
         )
         return None
 
