@@ -49,6 +49,50 @@ def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str]:
     return result.returncode, (result.stdout or "") + (result.stderr or "")
 
 
+# ── Env var loading ───────────────────────────────────────────────────────────
+
+def _parse_env_content(env_content: str) -> dict[str, str]:
+    """Parse a .env-style blob into a dict.
+
+    Handles `KEY=VALUE`, optional surrounding quotes, # comments, and blank
+    lines. No dotenv interpolation — that's a runtime concern for the app.
+    """
+    result: dict[str, str] = {}
+    if not env_content:
+        return result
+    for raw in env_content.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if not key:
+            continue
+        if (len(value) >= 2) and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        result[key] = value
+    return result
+
+
+def _materialize_env_files(repo_dir: Path, env: dict[str, str]) -> None:
+    """Write env to .env.production and .env.local in the build context.
+
+    Next.js auto-loads both at build time AND runtime, which means NEXT_PUBLIC_*
+    get baked into the client bundle correctly without needing Docker buildargs.
+    Writes both names because some projects only check one. Overwrites any
+    existing file (preview values trump committed-but-empty examples).
+    """
+    if not env:
+        return
+    lines = [f"{k}={v}" for k, v in env.items()]
+    body = "\n".join(lines) + "\n"
+    for name in (".env.production", ".env.local", ".env"):
+        (repo_dir / name).write_text(body)
+
+
 # ── Project type detection ────────────────────────────────────────────────────
 
 def _detect_project_type(repo_dir: Path) -> str:
@@ -261,6 +305,33 @@ async def run_preview_locally(
         await emit_error(project_id, msg)
         return None
 
+    # Pull the project's deploy_target.env_content (collected at onboarding,
+    # also used for GitHub Actions deploy secrets) and materialise it into the
+    # build context so Next.js bakes NEXT_PUBLIC_* at build time AND the
+    # server-side process.env sees the rest at runtime. Without this every
+    # preview crashes with HTTP 500 the moment a request touches Supabase /
+    # Auth.js / any code that reads process.env.
+    from orchestrator.models.project import get_project as _get_project_for_env
+    project_record = await _get_project_for_env(project_id)
+    deploy_target = (project_record or {}).get("deploy_target") or {}
+    env_content = str(deploy_target.get("env_content") or "")
+    env_vars = _parse_env_content(env_content)
+    if env_vars:
+        _materialize_env_files(repo_dir, env_vars)
+        await _log(
+            f"Preview: injected {len(env_vars)} env var(s) from project's deploy_target.env_content",
+            "Wrote .env.production, .env.local, .env into the build context — "
+            "Next.js auto-loads them at build (for NEXT_PUBLIC_*) and runtime (for server-side).",
+        )
+    else:
+        await _log(
+            "Preview: no env vars to inject",
+            "deploy_target.env_content is empty. If the app reads process.env at runtime, "
+            "expect HTTP 500 once a request reaches that code. Set env_content in the project's "
+            "deploy target (same place GitHub Actions secrets come from).",
+            "AMBIGUITY",
+        )
+
     _ensure_dockerfile(repo_dir, project_type)
 
     port = _find_free_port()
@@ -321,7 +392,9 @@ async def run_preview_locally(
 
         internal_port = _detect_internal_port(repo_dir)
 
-        # Run
+        # Run — pass env_vars as runtime environment too. Belt-and-braces
+        # alongside the .env files; some frameworks (or custom servers) read
+        # process.env directly without dotenv loading.
         try:
             client.containers.run(
                 image_name,
@@ -329,6 +402,7 @@ async def run_preview_locally(
                 name=container_name,
                 ports={f"{internal_port}/tcp": port},
                 restart_policy={"Name": "unless-stopped"},
+                environment=env_vars or None,
             )
         except Exception as exc:
             logger.error("Preview: docker run failed: %s", exc)
