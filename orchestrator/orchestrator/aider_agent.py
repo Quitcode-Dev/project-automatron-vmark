@@ -1036,7 +1036,14 @@ async def _implement_issue_locked(
         fix_task = (
             f"The code you just wrote has a build error. Fix it.\n\n"
             f"Build error:\n```\n{build_output[-3000:]}\n```\n\n"
-            f"Fix only what is broken. Do not rewrite files that are working."
+            f"Fix only what is broken. Do not rewrite files that are working.\n\n"
+            f"IMPORTANT — DO NOT create new files in response to error messages that mention "
+            f"file paths. Error messages list the paths of files that ALREADY EXIST and are "
+            f"broken. Edit the existing file; do not create a new one at the path mentioned.\n\n"
+            f"If the error says 'parallel pages' or 'cannot have two pages that resolve to the "
+            f"same path', the fix is to DELETE one of the two files (not create a third). "
+            f"The orchestrator will auto-resolve route collisions, so just leave duplicates "
+            f"alone if you see them — fix the underlying type/import/syntax error instead."
         )
         # Extract any file paths mentioned in the build error and pass them as
         # --file args. Without this, Aider's diff format has no files in context
@@ -1074,6 +1081,31 @@ async def _implement_issue_locked(
 
         _, fix_out = await _run_aider(fix_cmd, cwd=repo_dir, env=env)
         logger.info("Aider fix run output:\n%s", redact(fix_out[-2000:]))
+
+        # Re-run the post-Aider sanitisers between retry and second build check.
+        # Without this, an Aider retry that misinterprets a route-collision
+        # error as "missing file" (and creates the wrong-side duplicate) sails
+        # straight to the build check with the same collision intact —
+        # producing the "needs human help" blocker even though the structural
+        # fix is automatic.
+        retry_path_fixes = await _fix_nextjs_page_paths(repo_dir, default_branch)
+        if retry_path_fixes:
+            logger.info(
+                "Aider: post-retry path-fix moved %d misplaced page file(s) for issue #%d",
+                retry_path_fixes, issue_number,
+            )
+        retry_enforced = await _enforce_aider_deletions(repo_dir, default_branch)
+        if retry_enforced:
+            logger.info(
+                "Aider: post-retry enforced %d deletion(s) for issue #%d",
+                retry_enforced, issue_number,
+            )
+        retry_collisions = await _resolve_route_collisions(repo_dir, default_branch)
+        if retry_collisions:
+            logger.info(
+                "Aider: post-retry resolved %d route collision file(s) for issue #%d",
+                retry_collisions, issue_number,
+            )
 
         build_passed2, build_output2 = await run_build_in_docker(repo_dir)
         if not build_passed2:
