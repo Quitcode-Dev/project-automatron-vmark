@@ -305,30 +305,58 @@ async def run_preview_locally(
         await emit_error(project_id, msg)
         return None
 
-    # Pull the project's deploy_target.env_content (collected at onboarding,
-    # also used for GitHub Actions deploy secrets) and materialise it into the
-    # build context so Next.js bakes NEXT_PUBLIC_* at build time AND the
-    # server-side process.env sees the rest at runtime. Without this every
-    # preview crashes with HTTP 500 the moment a request touches Supabase /
-    # Auth.js / any code that reads process.env.
+    # Build the env to inject from TWO sources, in this priority order:
+    #   1. project.supabase_url / supabase_anon_key / supabase_service_role_key
+    #      → mapped to the standard Next.js + Supabase env var names. These
+    #        are top-level project columns set in the New Project modal.
+    #   2. deploy_target.env_content (free-form .env blob, also used as
+    #      GitHub Actions deploy secrets). Overrides (1) when the same key
+    #      appears — lets a user point preview at a different env without
+    #      changing the canonical Supabase config.
+    # Without this every preview crashes with HTTP 500 the moment a request
+    # touches Supabase/Auth.js/any code that reads process.env.
     from orchestrator.models.project import get_project as _get_project_for_env
-    project_record = await _get_project_for_env(project_id)
-    deploy_target = (project_record or {}).get("deploy_target") or {}
+    project_record = await _get_project_for_env(project_id) or {}
+
+    env_vars: dict[str, str] = {}
+    sources: list[str] = []
+
+    supa_url = str(project_record.get("supabase_url") or "").strip()
+    supa_anon = str(project_record.get("supabase_anon_key") or "").strip()
+    supa_service = str(project_record.get("supabase_service_role_key") or "").strip()
+    if supa_url:
+        env_vars["NEXT_PUBLIC_SUPABASE_URL"] = supa_url
+        env_vars["SUPABASE_URL"] = supa_url
+    if supa_anon:
+        env_vars["NEXT_PUBLIC_SUPABASE_ANON_KEY"] = supa_anon
+        env_vars["SUPABASE_ANON_KEY"] = supa_anon
+    if supa_service:
+        env_vars["SUPABASE_SERVICE_ROLE_KEY"] = supa_service
+    if supa_url or supa_anon or supa_service:
+        sources.append(f"project.supabase_* ({sum(bool(x) for x in (supa_url, supa_anon, supa_service))} field(s))")
+
+    deploy_target = project_record.get("deploy_target") or {}
     env_content = str(deploy_target.get("env_content") or "")
-    env_vars = _parse_env_content(env_content)
+    parsed_env_content = _parse_env_content(env_content)
+    if parsed_env_content:
+        env_vars.update(parsed_env_content)  # overrides supabase_* on key collision
+        sources.append(f"deploy_target.env_content ({len(parsed_env_content)} var(s))")
+
     if env_vars:
         _materialize_env_files(repo_dir, env_vars)
         await _log(
-            f"Preview: injected {len(env_vars)} env var(s) from project's deploy_target.env_content",
+            f"Preview: injected {len(env_vars)} env var(s) from {', '.join(sources)}",
             "Wrote .env.production, .env.local, .env into the build context — "
             "Next.js auto-loads them at build (for NEXT_PUBLIC_*) and runtime (for server-side).",
         )
     else:
         await _log(
             "Preview: no env vars to inject",
-            "deploy_target.env_content is empty. If the app reads process.env at runtime, "
-            "expect HTTP 500 once a request reaches that code. Set env_content in the project's "
-            "deploy target (same place GitHub Actions secrets come from).",
+            "Neither project.supabase_url/anon_key/service_role_key NOR "
+            "deploy_target.env_content is set. Expect HTTP 500 once a request reaches "
+            "code that reads process.env. Set Supabase config in the New Project modal "
+            "(or via project settings) and/or paste your full .env into the Deploy tab's "
+            "Environment File field.",
             "AMBIGUITY",
         )
 
