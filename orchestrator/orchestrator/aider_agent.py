@@ -692,7 +692,14 @@ async def _implement_issue_locked(
 
     if is_reimplementation and branch_on_remote:
         logger.info("Aider: continuing from existing branch %s for issue #%d", branch, issue_number)
+        # Defensive: clear any half-merge left by a killed prior process.
+        # The current working tree may also be dirty from a prior run — get
+        # rid of all uncommitted/untracked state BEFORE the checkout+merge
+        # so the merge doesn't fail with "untracked files would be overwritten".
+        await _run(["git", "merge", "--abort"], cwd=repo_dir)
         await _run(["git", "checkout", "-B", branch, f"origin/{branch}"], cwd=repo_dir)
+        await _run(["git", "reset", "--hard", f"origin/{branch}"], cwd=repo_dir)
+        await _run(["git", "clean", "-fd"], cwd=repo_dir)
         # Compose with main: merge default_branch into the branch so the
         # workspace (and the pre-push build check) reflects what shipping
         # this PR would actually produce. Without this, a re-implementation
@@ -712,9 +719,23 @@ async def _implement_issue_locked(
         if merge_rc != 0:
             _, conflicts_out = await _run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=repo_dir)
             await _run(["git", "merge", "--abort"], cwd=repo_dir)
-            conflicts = conflicts_out.strip() or "(unknown)"
+            conflicts = conflicts_out.strip()
+            # When --diff-filter=U is empty, the merge aborted before reaching
+            # a 3-way merge (e.g. "untracked working tree files would be
+            # overwritten by merge"). Surface git's actual stderr instead of
+            # saying "(unknown)" — that diagnostic was a dead end for the user.
+            if conflicts:
+                detail_for_user = f"Merge conflict between `{default_branch}` and `{branch}` in files:\n{conflicts}"
+                detail_for_log = f"Conflicting files:\n{conflicts}\n\nGit output:\n{merge_out[-1500:]}"
+            else:
+                tail = merge_out.strip()[-800:] or "(no output)"
+                detail_for_user = (
+                    f"`git merge {default_branch}` into `{branch}` failed without producing a conflict list "
+                    f"(the merge was rejected before a 3-way merge). Git said:\n```\n{tail}\n```"
+                )
+                detail_for_log = f"No conflict list returned. Full git output:\n{merge_out[-1500:]}"
             logger.error(
-                "Aider: merge of %s into %s conflicted for issue #%d:\n%s",
+                "Aider: merge of %s into %s failed for issue #%d:\n%s",
                 default_branch, branch, issue_number, merge_out,
             )
             try:
@@ -723,17 +744,13 @@ async def _implement_issue_locked(
                 seq = (max((r.get("seq", 0) for r in existing), default=0) + 1)
                 await save_activity_log(
                     project_id, seq,
-                    f"Aider: merge conflict on issue #{issue_number}",
-                    f"Merging `{default_branch}` into `{branch}` produced conflicts in:\n"
-                    f"{conflicts}\n\nGit output:\n{merge_out[-1500:]}",
+                    f"Aider: merge from `{default_branch}` failed for issue #{issue_number}",
+                    detail_for_log,
                     "ERROR",
                 )
             except Exception as exc:
-                logger.warning("Aider: failed to persist merge conflict to activity log: %s", exc)
-            return None, (
-                f"Merge conflict between `{default_branch}` and `{branch}` in files:\n{conflicts}\n"
-                f"Resolve on GitHub (rebase or merge) and re-run Implement."
-            )
+                logger.warning("Aider: failed to persist merge failure to activity log: %s", exc)
+            return None, f"{detail_for_user}\n\nResolve on GitHub (rebase or merge) and re-run Implement."
         logger.info(
             "Aider: merged %s into %s for issue #%d (compose-on-main)",
             default_branch, branch, issue_number,
@@ -744,10 +761,10 @@ async def _implement_issue_locked(
         await _run(["git", "reset", "--hard", f"origin/{default_branch}"], cwd=repo_dir)
         await _run(["git", "checkout", "-B", branch], cwd=repo_dir)
 
-    # Remove untracked files left over from prior runs (e.g. empty placeholder
-    # directories Aider created that were never committed). Respects .gitignore so
-    # node_modules/.next survive. Without this, stale files sabotage subsequent builds.
-    await _run(["git", "clean", "-fd"], cwd=repo_dir)
+        # Remove untracked files left over from prior runs (e.g. empty placeholder
+        # directories Aider created that were never committed). Respects .gitignore so
+        # node_modules/.next survive. Without this, stale files sabotage subsequent builds.
+        await _run(["git", "clean", "-fd"], cwd=repo_dir)
 
     # Re-implementation: diff patches only the broken parts in existing files on the branch.
     # Fresh implementation: whole writes complete new files from scratch (diff needs files
