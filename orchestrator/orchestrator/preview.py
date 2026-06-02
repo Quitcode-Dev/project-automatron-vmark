@@ -140,16 +140,31 @@ async def run_preview_locally(
     """Clone the repo, build, and run it in Docker. Returns the preview URL or None.
 
     If `branch` is provided, that branch is checked out instead of `default_branch`.
-    This lets the user preview an in-flight Aider PR branch (e.g. `aider/fix-43`)
-    before merging, which is the only way to preview anything when `main` is still
-    a planning scaffold without a `package.json`.
+    Emits an activity_log entry at every major step so the UI shows progress
+    instead of going silent for 60-120s while the docker image builds.
     """
+    from orchestrator.models.project import save_activity_log, get_activity_logs
+    from orchestrator.api.websocket import emit_error
+
     workspace = settings.workspace_base_dir / str(project_id)
     workspace.mkdir(parents=True, exist_ok=True)
     # Use a separate directory from the aider workspace to avoid branch conflicts
     repo_dir = workspace / "preview-repo"
 
     target_branch = branch or default_branch
+
+    # Sequence counter shared across all activity_log entries for this preview run.
+    existing = await get_activity_logs(project_id)
+    _seq = [max((r.get("seq", 0) for r in existing), default=0) + 1]
+
+    async def _log(title: str, body: str = "", level: str = "INFO") -> None:
+        await save_activity_log(project_id, _seq[0], title, body, level)
+        _seq[0] += 1
+
+    await _log(
+        f"Preview: starting (branch={target_branch})",
+        f"Repo: {owner}/{repo} • default: {default_branch}",
+    )
 
     token = settings.github_token
     clone_url = (
@@ -160,20 +175,27 @@ async def run_preview_locally(
 
     if (repo_dir / ".git").exists():
         logger.info("Preview: syncing %s/%s to %s", owner, repo, target_branch)
+        await _log(f"Preview: syncing branch `{target_branch}`")
         _run(["git", "remote", "set-url", "origin", clone_url], cwd=repo_dir)
         _run(["git", "fetch", "origin", target_branch], cwd=repo_dir)
         _run(["git", "checkout", "-B", target_branch, f"origin/{target_branch}"], cwd=repo_dir)
         rc, out = _run(["git", "reset", "--hard", f"origin/{target_branch}"], cwd=repo_dir)
     else:
         logger.info("Preview: cloning %s/%s @ %s", owner, repo, target_branch)
+        await _log(f"Preview: cloning `{owner}/{repo}` @ `{target_branch}`")
         rc, out = _run(["git", "clone", "--branch", target_branch, clone_url, str(repo_dir)])
 
     if rc != 0:
         logger.error("Preview: git failed:\n%s", out)
-        from orchestrator.api.websocket import emit_error
+        from orchestrator.logsafe import redact
+        await _log(
+            "Preview: git checkout failed",
+            redact(out)[-1000:],
+            "ERROR",
+        )
         await emit_error(
             project_id,
-            f"Preview: could not check out branch `{target_branch}` — {out[-200:].strip()}",
+            f"Preview: could not check out branch `{target_branch}` — {redact(out)[-200:].strip()}",
         )
         return None
 
@@ -182,6 +204,7 @@ async def run_preview_locally(
     # cut from an older main misses any scaffolding/config commits that landed
     # on main after the branch was created (e.g. orchestrator-managed scaffold).
     if target_branch != default_branch:
+        await _log(f"Preview: merging `{default_branch}` into `{target_branch}` (compose-on-main)")
         _run(["git", "fetch", "origin", default_branch], cwd=repo_dir)
         merge_rc, merge_out = _run(
             [
@@ -198,7 +221,11 @@ async def run_preview_locally(
             _run(["git", "merge", "--abort"], cwd=repo_dir)
             conflicts = conflicts_out.strip() or "(unknown)"
             logger.error("Preview: merge of %s into %s failed:\n%s", default_branch, target_branch, merge_out)
-            from orchestrator.api.websocket import emit_error
+            await _log(
+                f"Preview: merge conflict — `{default_branch}` ↔ `{target_branch}`",
+                f"Conflicting paths:\n{conflicts}\n\nGit output:\n{merge_out[-800:]}",
+                "ERROR",
+            )
             await emit_error(
                 project_id,
                 f"Preview: merging `{default_branch}` into `{target_branch}` produced conflicts in:\n"
@@ -210,10 +237,10 @@ async def run_preview_locally(
 
     project_type = _detect_project_type(repo_dir)
     logger.info("Preview: detected project type=%s for %s/%s @ %s", project_type, owner, repo, target_branch)
+    await _log(f"Preview: detected project type = `{project_type}`")
 
     if project_type == "unknown":
         logger.warning("Preview: unrecognised project type for %s/%s @ %s", owner, repo, target_branch)
-        from orchestrator.api.websocket import emit_error
         if target_branch != default_branch:
             msg = (
                 f"Preview cannot start: even after merging `{default_branch}` into `{target_branch}`, "
@@ -228,6 +255,7 @@ async def run_preview_locally(
                 f"on `{target_branch}`. The orchestrator's scaffolding step did not run. "
                 f"Re-run planning, or push a scaffold to `{target_branch}` manually."
             )
+        await _log("Preview: aborted — no recognisable project type", msg, "ERROR")
         await emit_error(project_id, msg)
         return None
 
@@ -238,7 +266,18 @@ async def run_preview_locally(
     image_name = f"automatron-preview-{project_id}"
 
     import docker as docker_sdk
-    client = docker_sdk.from_env()
+    try:
+        client = docker_sdk.from_env()
+    except Exception as exc:
+        logger.error("Preview: docker daemon unreachable: %s", exc)
+        await _log("Preview: Docker daemon unreachable", str(exc), "ERROR")
+        await emit_error(
+            project_id,
+            f"Preview: Docker daemon is not reachable from the orchestrator — `{exc}`. "
+            f"Check that the orchestrator container has `/var/run/docker.sock` mounted.",
+        )
+        return None
+
     try:
         # Stop any existing container for this project
         try:
@@ -250,6 +289,10 @@ async def run_preview_locally(
 
         # Build
         logger.info("Preview: building image %s", image_name)
+        await _log(
+            f"Preview: building docker image `{image_name}`",
+            "This usually takes 60–120 seconds for a first build (npm install + npm run build).",
+        )
         try:
             _, build_logs = client.images.build(path=str(repo_dir), tag=image_name, rm=True)
             for chunk in build_logs:
@@ -264,6 +307,14 @@ async def run_preview_locally(
                 if chunk.get("stream") or chunk.get("error")
             )
             logger.error("Preview: docker build failed:\n%s", build_output[-3000:])
+            from orchestrator.logsafe import redact
+            safe = redact(build_output)
+            await _log("Preview: docker build FAILED", safe[-3000:], "ERROR")
+            await emit_error(
+                project_id,
+                f"Preview: docker build failed on `{target_branch}`. See activity log for the full output. "
+                f"Tail:\n```\n{safe[-600:]}\n```",
+            )
             return None
 
         internal_port = _detect_internal_port(repo_dir)
@@ -279,7 +330,16 @@ async def run_preview_locally(
             )
         except Exception as exc:
             logger.error("Preview: docker run failed: %s", exc)
+            await _log("Preview: docker run FAILED", str(exc), "ERROR")
+            await emit_error(
+                project_id,
+                f"Preview: container failed to start — `{exc}`",
+            )
             return None
+        await _log(
+            f"Preview: container started on port {port}",
+            f"Container `{container_name}` from image `{image_name}` mapped {internal_port} → {port}.",
+        )
     finally:
         try:
             client.close()
@@ -298,6 +358,7 @@ async def run_preview_locally(
     # Health-check using localhost — containers can't reach the public hostname via hairpin NAT
     health_url = f"http://localhost:{port}"
     logger.info("Preview: container started, polling %s", health_url)
+    await _log("Preview: waiting for HTTP readiness", f"Polling {health_url} every 3s for up to 60s.")
 
     for attempt in range(20):
         await asyncio.sleep(3)
@@ -306,9 +367,20 @@ async def run_preview_locally(
                 resp = await client.get(health_url)
                 if resp.status_code < 500:
                     logger.info("Preview: ready at %s (attempt %d)", preview_url, attempt + 1)
+                    await _log(
+                        f"Preview: READY → {preview_url}",
+                        f"Container responded with HTTP {resp.status_code} after {(attempt + 1) * 3}s.",
+                        "INFO",
+                    )
                     return preview_url
         except Exception:
             pass
 
     logger.warning("Preview: health check timed out, returning URL anyway: %s", preview_url)
+    await _log(
+        f"Preview: URL ready but health check timed out → {preview_url}",
+        "Container is running but did not respond on the expected port within 60s. "
+        "Open the URL anyway — it may just be slow to start.",
+        "AMBIGUITY",
+    )
     return preview_url

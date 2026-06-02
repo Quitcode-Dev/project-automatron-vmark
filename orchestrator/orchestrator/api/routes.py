@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from typing import Any, Literal
 
 import io
 import json
 import zipfile
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -543,11 +546,36 @@ async def _run_preview_and_save(
 ) -> None:
     from orchestrator.preview import run_preview_locally
     from orchestrator.api.websocket import emit_status_update, emit_error
-    preview_url = await run_preview_locally(project_id, owner, repo, default_branch, branch=branch)
+    from orchestrator.models.project import save_activity_log, get_activity_logs
+
+    # FastAPI swallows exceptions from BackgroundTasks. Without this wrapper a
+    # crash anywhere in run_preview_locally (e.g. AttributeError before the
+    # first emit_error path) would leave the user staring at a silent UI. Always
+    # surface SOMETHING.
+    try:
+        preview_url = await run_preview_locally(project_id, owner, repo, default_branch, branch=branch)
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        logger.exception("Preview: unhandled exception in run_preview_locally")
+        try:
+            existing = await get_activity_logs(project_id)
+            seq = max((r.get("seq", 0) for r in existing), default=0) + 1
+            await save_activity_log(
+                project_id, seq, "Preview: CRASHED",
+                f"Unhandled exception: {exc!r}\n\n{tb[-2000:]}", "ERROR",
+            )
+        except Exception:
+            logger.exception("Preview: also failed to write crash log to activity_logs")
+        await emit_error(
+            project_id,
+            f"Preview crashed with an unhandled exception: `{exc!r}`. See activity log for the traceback.",
+        )
+        return
+
     if not preview_url:
-        # run_preview_locally already emits a specific emit_error on the known
-        # failure paths (unknown project type, git checkout fail). Only emit the
-        # generic message when we got here for some other reason.
+        # run_preview_locally already emits a specific emit_error + activity_log
+        # entry on the known failure paths.
         return
     await update_project_preview(project_id, preview_url, "ready")
     project = await get_project(project_id)
