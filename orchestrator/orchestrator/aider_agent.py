@@ -693,6 +693,51 @@ async def _implement_issue_locked(
     if is_reimplementation and branch_on_remote:
         logger.info("Aider: continuing from existing branch %s for issue #%d", branch, issue_number)
         await _run(["git", "checkout", "-B", branch, f"origin/{branch}"], cwd=repo_dir)
+        # Compose with main: merge default_branch into the branch so the
+        # workspace (and the pre-push build check) reflects what shipping
+        # this PR would actually produce. Without this, a re-implementation
+        # branch cut from an older main misses any commits that landed on
+        # main afterwards (e.g. orchestrator-managed scaffolding), and the
+        # pre-push build check silently SKIPS (no package.json) → broken
+        # code reaches GitHub.
+        merge_rc, merge_out = await _run(
+            [
+                "git",
+                "-c", "user.email=aider@automatron.local",
+                "-c", "user.name=Automatron Aider",
+                "merge", "--no-edit", f"origin/{default_branch}",
+            ],
+            cwd=repo_dir,
+        )
+        if merge_rc != 0:
+            _, conflicts_out = await _run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=repo_dir)
+            await _run(["git", "merge", "--abort"], cwd=repo_dir)
+            conflicts = conflicts_out.strip() or "(unknown)"
+            logger.error(
+                "Aider: merge of %s into %s conflicted for issue #%d:\n%s",
+                default_branch, branch, issue_number, merge_out,
+            )
+            try:
+                from orchestrator.models.project import save_activity_log, get_activity_logs
+                existing = await get_activity_logs(project_id)
+                seq = (max((r.get("seq", 0) for r in existing), default=0) + 1)
+                await save_activity_log(
+                    project_id, seq,
+                    f"Aider: merge conflict on issue #{issue_number}",
+                    f"Merging `{default_branch}` into `{branch}` produced conflicts in:\n"
+                    f"{conflicts}\n\nGit output:\n{merge_out[-1500:]}",
+                    "ERROR",
+                )
+            except Exception as exc:
+                logger.warning("Aider: failed to persist merge conflict to activity log: %s", exc)
+            return None, (
+                f"Merge conflict between `{default_branch}` and `{branch}` in files:\n{conflicts}\n"
+                f"Resolve on GitHub (rebase or merge) and re-run Implement."
+            )
+        logger.info(
+            "Aider: merged %s into %s for issue #%d (compose-on-main)",
+            default_branch, branch, issue_number,
+        )
     else:
         logger.info("Aider: resetting to %s for issue #%d", default_branch, issue_number)
         await _run(["git", "checkout", default_branch], cwd=repo_dir)
