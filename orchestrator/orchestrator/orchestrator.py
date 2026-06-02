@@ -1689,11 +1689,23 @@ async def implement_with_aider(
         )
 
     if extra_context:
-        issue_body += (
-            f"\n\n---\n## Additional context — surfaced from an Automatron activity error\n\n"
-            f"The user reported the following error in the activity log and asked you to fix it. "
-            f"Address it on the existing branch — do not rewrite files that aren't related.\n\n"
-            f"{extra_context}"
+        # Prepend, not append. When extra_context lived at the bottom of a
+        # multi-KB spec, the LLM treated it as a footnote and kept executing
+        # the top-level spec — producing zero diff (everything already done)
+        # and falling back to .gitignore housekeeping. Hoisted to the top
+        # and framed as the PRIMARY directive, it dominates Aider's attention.
+        issue_body = (
+            f"# PRIMARY DIRECTIVE — Fix this error\n\n"
+            f"This issue was previously implemented. A subsequent build or runtime "
+            f"error was reported on the branch. Your PRIMARY task is to fix the error "
+            f"below. The original spec is preserved further down as **reference only**: "
+            f"do not re-implement files that already work — only patch what the error "
+            f"says is broken. The error often names the exact file and line.\n\n"
+            f"## Error to fix\n\n"
+            f"{extra_context}\n\n"
+            f"---\n\n"
+            f"## Original issue spec (reference only — do NOT re-implement)\n\n"
+            f"{issue_body}"
         )
 
     llm_cfg = await orch._llm_config()

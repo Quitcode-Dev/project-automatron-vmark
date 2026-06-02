@@ -1038,12 +1038,33 @@ async def _implement_issue_locked(
             f"Build error:\n```\n{build_output[-3000:]}\n```\n\n"
             f"Fix only what is broken. Do not rewrite files that are working."
         )
+        # Extract any file paths mentioned in the build error and pass them as
+        # --file args. Without this, Aider's diff format has no files in context
+        # and the retry resorts to .gitignore housekeeping (the LLM produces
+        # text but has nowhere to write a patch).
+        error_file_paths = _extract_file_paths(build_output)
+        if error_file_paths:
+            logger.info(
+                "Aider: build error mentioned %d file(s) — adding to retry context: %s",
+                len(error_file_paths), error_file_paths,
+            )
         fix_args = [
             "--model", model, "--message", fix_task,
             "--yes", "--no-pretty", "--no-check-update", "--no-show-model-warnings",
             "--edit-format", "diff",
             "--map-tokens", "4096", "--git", "--auto-commits",
         ]
+        # Always re-pass the original spec's --file targets so Aider has its
+        # working set. Augment with files named in the build error.
+        retry_files: list[str] = []
+        for fp in file_paths:
+            if (repo_dir / fp).exists() and fp not in retry_files:
+                retry_files.append(fp)
+        for fp in error_file_paths:
+            if (repo_dir / fp).exists() and fp not in retry_files:
+                retry_files.append(fp)
+        for fp in retry_files:
+            fix_args.extend(["--file", fp])
         if shutil.which("aider"):
             fix_cmd = ["aider", *fix_args]
         elif shutil.which("uvx"):
