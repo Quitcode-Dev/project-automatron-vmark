@@ -177,20 +177,58 @@ async def run_preview_locally(
         )
         return None
 
+    # Compose: merge default_branch into target_branch so the preview reflects
+    # what shipping the PR would actually produce. Without this, an Aider branch
+    # cut from an older main misses any scaffolding/config commits that landed
+    # on main after the branch was created (e.g. orchestrator-managed scaffold).
+    if target_branch != default_branch:
+        _run(["git", "fetch", "origin", default_branch], cwd=repo_dir)
+        merge_rc, merge_out = _run(
+            [
+                "git",
+                "-c", "user.email=preview@automatron.local",
+                "-c", "user.name=Automatron Preview",
+                "merge", "--no-edit", f"origin/{default_branch}",
+            ],
+            cwd=repo_dir,
+        )
+        if merge_rc != 0:
+            # Conflict — surface the conflicting paths and bail.
+            _, conflicts_out = _run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=repo_dir)
+            _run(["git", "merge", "--abort"], cwd=repo_dir)
+            conflicts = conflicts_out.strip() or "(unknown)"
+            logger.error("Preview: merge of %s into %s failed:\n%s", default_branch, target_branch, merge_out)
+            from orchestrator.api.websocket import emit_error
+            await emit_error(
+                project_id,
+                f"Preview: merging `{default_branch}` into `{target_branch}` produced conflicts in:\n"
+                f"```\n{conflicts}\n```\n"
+                f"Resolve them on the PR (rebase or merge `{default_branch}` into the branch) and try again.",
+            )
+            return None
+        logger.info("Preview: merged %s into %s for compose-on-main preview", default_branch, target_branch)
+
     project_type = _detect_project_type(repo_dir)
     logger.info("Preview: detected project type=%s for %s/%s @ %s", project_type, owner, repo, target_branch)
 
     if project_type == "unknown":
         logger.warning("Preview: unrecognised project type for %s/%s @ %s", owner, repo, target_branch)
         from orchestrator.api.websocket import emit_error
-        await emit_error(
-            project_id,
-            f"Preview cannot start: no package.json on `{target_branch}`. "
-            f"Aider branches are `main + this-issue's-diff` — when the project-init issue "
-            f"(the one that creates package.json) hasn't been merged to main yet, none of "
-            f"the later feature branches carry it either. Implement & merge the init issue first, "
-            f"then every aider/fix-N preview will compose on top of it.",
-        )
+        if target_branch != default_branch:
+            msg = (
+                f"Preview cannot start: even after merging `{default_branch}` into `{target_branch}`, "
+                f"no `package.json` (or `pyproject.toml`/`requirements.txt`) exists. "
+                f"That means `{default_branch}` itself is unscaffolded — the orchestrator's "
+                f"scaffolding step did not run (or detected no framework from the intake). "
+                f"Re-run planning on this project, or push a scaffold to `{default_branch}` manually."
+            )
+        else:
+            msg = (
+                f"Preview cannot start: no `package.json` (or `pyproject.toml`/`requirements.txt`) "
+                f"on `{target_branch}`. The orchestrator's scaffolding step did not run. "
+                f"Re-run planning, or push a scaffold to `{target_branch}` manually."
+            )
+        await emit_error(project_id, msg)
         return None
 
     _ensure_dockerfile(repo_dir, project_type)
