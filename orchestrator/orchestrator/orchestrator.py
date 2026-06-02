@@ -999,6 +999,25 @@ class GitHubOrchestrator:
         self._set_trace("pr_review", "reviewer")
         await self._log(f"Reviewing PR #{pr_number}", f"Issue #{issue_number} · {owner}/{repo}")
 
+        # Short-circuit if we already reviewed this exact PR head SHA. Every PR
+        # `opened`/`reopened` webhook fires a fresh review, but a chain of
+        # auto-pushes to the same PR (re-impl loop, retry path, etc.) can fire
+        # the webhook 3-5 times in a row with NO code change between firings.
+        # Re-running the reviewer LLM each time burns expensive tokens for
+        # identical output. Cache by head SHA.
+        head_sha = await self.gh.get_pr_head_sha(owner, repo, pr_number)
+        if head_sha:
+            from orchestrator.models.project import _get_github_issue
+            existing_local = await _get_github_issue(self.project_id, issue_number)
+            existing_review = (existing_local or {}).get("pr_review") or {}
+            if existing_review.get("head_sha") == head_sha:
+                await self._log(
+                    f"Reviewer: PR #{pr_number} head unchanged — skipping",
+                    f"head_sha {head_sha[:8]} matches the last review on record",
+                    "INFO",
+                )
+                return
+
         # Get diff and task spec (issue body)
         diff = await self.gh.get_pr_diff(owner, repo, pr_number)
         issue = await self.gh.get_issue(owner, repo, issue_number)
@@ -1176,6 +1195,7 @@ class GitHubOrchestrator:
             "summary": review_text,
             "pr_number": pr_number,
             "issue_number": issue_number,
+            "head_sha": head_sha,  # for cache-skip on next webhook firing
         }
 
         await update_github_issue_pr(

@@ -845,6 +845,11 @@ async def _implement_issue_locked(
         "--map-tokens", "4096",
         "--git",
         "--auto-commits",
+        # Anthropic prompt caching: cuts repeated-context input cost by ~90%.
+        # Aider's diff format resends the full --file content on every internal
+        # turn; without caching, an iteration that loops 4 turns pays 4× input
+        # tokens. Free 50-80% saving on Anthropic models at no quality cost.
+        "--cache-prompts",
     ]
 
     # Aider v0.86+ exits without any LLM call when no --file args are supplied.
@@ -1060,6 +1065,7 @@ async def _implement_issue_locked(
             "--yes", "--no-pretty", "--no-check-update", "--no-show-model-warnings",
             "--edit-format", "diff",
             "--map-tokens", "4096", "--git", "--auto-commits",
+            "--cache-prompts",  # same caching as main run — see comment above
         ]
         # Always re-pass the original spec's --file targets so Aider has its
         # working set. Augment with files named in the build error.
