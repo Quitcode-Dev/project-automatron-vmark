@@ -62,9 +62,15 @@ class RoleLlmConfig(BaseModel):
     model: str
 
 
+class BuilderRoleLlmConfig(RoleLlmConfig):
+    # "aider" (default) or "agent_sdk". normalize_llm_config falls back to
+    # the default if missing or invalid, so this is permissive on input.
+    engine: str | None = None
+
+
 class ProjectLlmConfigRequest(BaseModel):
     architect: RoleLlmConfig
-    builder: RoleLlmConfig
+    builder: BuilderRoleLlmConfig
     reviewer: RoleLlmConfig
 
 
