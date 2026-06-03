@@ -749,3 +749,629 @@ class TestMinimalDeploymentSequence:
         compose_up_mock.assert_not_called()
         # The run should not have completed successfully
         assert result.get("status") in ("failed", "rejected")
+
+
+# ---------------------------------------------------------------------------
+# Hardening — Docker Compose v2 prerequisite validation
+# ---------------------------------------------------------------------------
+
+def _make_snapshot_with_binary_info(
+    compose_v2: bool,
+    binary_present: bool = True,
+    daemon_reachable: bool = True,
+    has_compose_actions: bool = True,
+) -> tuple[dict, object]:
+    """Return (plan_dict, InventorySnapshot) for compose v2 validation tests."""
+    from orchestrator.docker_deployment_ai.models import InventorySnapshot, DetectionResult, DeploymentManager, ReverseProxy  # noqa: PLC0415
+
+    actions = (
+        [
+            {"action_type": "CREATE_DIRECTORY", "params": {}},
+            {"action_type": "DOCKER_COMPOSE_UP", "params": {}},
+        ]
+        if has_compose_actions
+        else [{"action_type": "CREATE_DIRECTORY", "params": {}}]
+    )
+    plan = {
+        "strategy": "docker_compose_with_host_port",
+        "risk_level": "low",
+        "deployment_actions": actions,
+    }
+    snapshot = InventorySnapshot(
+        target_id="tgt-1",
+        project_id="proj-1",
+        docker_binary_info={
+            "docker_binary_present": binary_present,
+            "docker_daemon_reachable": daemon_reachable,
+            "docker_compose_v2_available": compose_v2,
+            "docker_info_error": None if daemon_reachable else "connection refused",
+        },
+        detection=DetectionResult(
+            deployment_manager=DeploymentManager.none,
+            reverse_proxy=ReverseProxy.none,
+            confidence=0.5,
+        ),
+    )
+    return plan, snapshot
+
+
+class TestDockerComposeV2Validation:
+    """Compose-based plans are blocked when Docker Compose v2 is absent.
+
+    Covers:
+      - compose v2 available → validation passes
+      - only docker-compose v1 (binary present but plugin absent) → validation blocked
+      - docker binary missing entirely → validation blocked
+      - plan without compose actions → check passes even when v2 absent
+      - snapshot without docker_binary_info (old format) → non-blocking pass
+    """
+
+    def test_compose_v2_available_passes(self):
+        from orchestrator.docker_deployment_ai.validator import _check_docker_compose_v2  # noqa: PLC0415
+        plan, snapshot = _make_snapshot_with_binary_info(compose_v2=True)
+        check = _check_docker_compose_v2(plan, snapshot)
+        assert check.passed, f"Expected pass, got: {check.message}"
+        assert check.name == "docker_compose_v2_check"
+
+    def test_compose_v1_only_blocked(self):
+        """Binary present, daemon reachable, but compose plugin absent → blocked."""
+        from orchestrator.docker_deployment_ai.validator import _check_docker_compose_v2  # noqa: PLC0415
+        plan, snapshot = _make_snapshot_with_binary_info(
+            compose_v2=False, binary_present=True, daemon_reachable=True
+        )
+        check = _check_docker_compose_v2(plan, snapshot)
+        assert not check.passed
+        assert check.blocking
+        assert "compose v2" in check.message.lower() or "plugin" in check.message.lower()
+
+    def test_docker_binary_missing_blocked(self):
+        """No docker binary at all → blocked."""
+        from orchestrator.docker_deployment_ai.validator import _check_docker_compose_v2  # noqa: PLC0415
+        plan, snapshot = _make_snapshot_with_binary_info(
+            compose_v2=False, binary_present=False
+        )
+        check = _check_docker_compose_v2(plan, snapshot)
+        assert not check.passed
+        assert check.blocking
+        assert "docker" in check.message.lower()
+
+    def test_no_compose_actions_skips_check(self):
+        """Plans without compose actions pass regardless of v2 availability."""
+        from orchestrator.docker_deployment_ai.validator import _check_docker_compose_v2  # noqa: PLC0415
+        plan, snapshot = _make_snapshot_with_binary_info(
+            compose_v2=False, has_compose_actions=False
+        )
+        check = _check_docker_compose_v2(plan, snapshot)
+        assert check.passed
+
+    def test_old_snapshot_without_binary_info_passes_nonblocking(self):
+        """Snapshot without docker_binary_info (pre-hardening) must not block."""
+        from orchestrator.docker_deployment_ai.validator import _check_docker_compose_v2  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.models import InventorySnapshot, DetectionResult  # noqa: PLC0415
+        plan = {
+            "strategy": "docker_compose_with_host_port",
+            "risk_level": "low",
+            "deployment_actions": [{"action_type": "DOCKER_COMPOSE_UP", "params": {}}],
+        }
+        # Empty docker_binary_info (default) simulates old inventory
+        snapshot = InventorySnapshot(
+            target_id="tgt-x", project_id="proj-x",
+            detection=DetectionResult(),
+        )
+        check = _check_docker_compose_v2(plan, snapshot)
+        # Must pass (non-blocking warning, not a hard block)
+        assert check.passed
+
+    def test_full_validation_blocked_on_v1_host(self):
+        """validate_deployment_plan returns blocked status when compose v2 absent."""
+        from orchestrator.docker_deployment_ai.validator import validate_deployment_plan  # noqa: PLC0415
+        plan, snapshot = _make_snapshot_with_binary_info(compose_v2=False)
+        # Build a schema-valid plan
+        plan["summary"] = "test"
+        plan["docker_ai"] = {"provider": "litellm"}
+        plan["detected_server_state"] = {"reverse_proxy": "none", "deployment_manager": "none"}
+        plan["rollback_plan"] = {
+            "type": "compose_snapshot",
+            "previous_release_ref_required": False,
+            "steps": [],
+        }
+        plan["secrets_required"] = []
+        plan["blocking_questions"] = []
+        plan["port_plan"] = {}
+        plan["routing_plan"] = {}
+        result = validate_deployment_plan(plan, snapshot)
+        assert result.status == "blocked"
+        assert any("compose_v2" in c.name for c in result.checks if not c.passed)
+
+    def test_full_validation_passes_on_v2_host_with_no_containers(self):
+        """Fresh clean host with docker binary + compose v2 + zero containers passes."""
+        from orchestrator.docker_deployment_ai.validator import validate_deployment_plan  # noqa: PLC0415
+        plan, snapshot = _make_snapshot_with_binary_info(compose_v2=True)
+        plan["summary"] = "test"
+        plan["docker_ai"] = {"provider": "litellm"}
+        plan["detected_server_state"] = {"reverse_proxy": "none", "deployment_manager": "none"}
+        plan["rollback_plan"] = {
+            "type": "compose_snapshot",
+            "previous_release_ref_required": False,
+            "steps": [],
+        }
+        plan["secrets_required"] = []
+        plan["blocking_questions"] = []
+        plan["port_plan"] = {"host_port": 8080}
+        plan["routing_plan"] = {}
+        result = validate_deployment_plan(plan, snapshot)
+        compose_check = next(
+            (c for c in result.checks if c.name == "docker_compose_v2_check"), None
+        )
+        assert compose_check is not None
+        assert compose_check.passed
+
+
+# ---------------------------------------------------------------------------
+# Hardening — SSH allowlist includes docker compose version
+# ---------------------------------------------------------------------------
+
+class TestSSHAllowlistDockerComposeVersion:
+    """docker compose version and which docker must be on the inventory SSH allowlist."""
+
+    def test_docker_compose_version_on_allowlist(self):
+        from orchestrator.docker_deployment_ai.ssh_client import _ALLOWED_COMMANDS  # noqa: PLC0415
+        assert "docker compose version" in _ALLOWED_COMMANDS, (
+            "'docker compose version' must be on the SSH allowlist "
+            "so inventory can detect Compose v2 availability."
+        )
+
+    def test_which_docker_on_allowlist(self):
+        from orchestrator.docker_deployment_ai.ssh_client import _ALLOWED_COMMANDS  # noqa: PLC0415
+        assert "which docker" in _ALLOWED_COMMANDS
+
+
+# ---------------------------------------------------------------------------
+# Hardening — fresh clean host with Docker available and zero containers
+# ---------------------------------------------------------------------------
+
+class TestFreshHostWithDockerAvailable:
+    """A fresh host with Docker + Compose v2 and zero containers must not block
+    the planner strategy detection."""
+
+    def test_strategy_detection_none_manager_returns_valid_strategy(self):
+        """detection manager=none, proxy=none, confidence=0.5 must not return blocked."""
+        from orchestrator.docker_deployment_ai.planner import _strategy_from_detection  # noqa: PLC0415
+        strategy, risk, questions = _strategy_from_detection(
+            deployment_manager="none",
+            reverse_proxy="none",
+            confidence=0.5,
+            preferred_strategy="docker_compose_with_host_port",
+        )
+        # Explicit preferred_strategy must be honoured; risk should not escalate to blocked
+        assert strategy == "docker_compose_with_host_port"
+        assert risk != "blocked"
+
+    def test_strategy_detection_auto_detect_clean_host(self):
+        """auto_detect on a clean host (no proxy, no manager) suggests compose_private."""
+        from orchestrator.docker_deployment_ai.planner import _strategy_from_detection  # noqa: PLC0415
+        strategy, risk, _ = _strategy_from_detection(
+            deployment_manager="none",
+            reverse_proxy="none",
+            confidence=0.6,
+            preferred_strategy="auto_detect",
+        )
+        assert strategy == "docker_compose_private"
+        assert risk in ("low", "medium")
+
+    def test_compose_v2_check_passes_for_fresh_host(self):
+        """Fresh host with docker_compose_v2_available=True and zero containers passes."""
+        from orchestrator.docker_deployment_ai.validator import _check_docker_compose_v2  # noqa: PLC0415
+        plan = {
+            "deployment_actions": [
+                {"action_type": "DOCKER_COMPOSE_UP", "params": {}},
+                {"action_type": "DOCKER_COMPOSE_PS", "params": {}},
+            ]
+        }
+        from orchestrator.docker_deployment_ai.models import InventorySnapshot, DetectionResult, DeploymentManager, ReverseProxy  # noqa: PLC0415
+        snapshot = InventorySnapshot(
+            target_id="t", project_id="p",
+            docker_binary_info={
+                "docker_binary_present": True,
+                "docker_daemon_reachable": True,
+                "docker_compose_v2_available": True,
+                "docker_info_error": None,
+            },
+            containers=[],  # zero containers — must not trigger blocking
+            detection=DetectionResult(
+                deployment_manager=DeploymentManager.none,
+                reverse_proxy=ReverseProxy.none,
+                confidence=0.6,
+            ),
+        )
+        check = _check_docker_compose_v2(plan, snapshot)
+        assert check.passed
+
+
+# ---------------------------------------------------------------------------
+# Planner action generation — _build_deployment_actions unit tests
+# ---------------------------------------------------------------------------
+
+_HELLO_COMPOSE = (
+    "version: \"3.8\"\n"
+    "services:\n"
+    "  hello:\n"
+    "    image: nginxdemos/hello:plain-text\n"
+    "    ports:\n"
+    "      - \"8080:80\"\n"
+    "    restart: unless-stopped\n"
+)
+_DEPLOY_PATH = "/opt/deploy/testapp"
+
+
+class TestBuildDeploymentActions:
+    """_build_deployment_actions deterministically builds the 5-step sequence."""
+
+    def test_compose_strategy_with_content_returns_five_actions(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        actions, questions = _build_deployment_actions(
+            "docker_compose_with_host_port",
+            {"compose_content": _HELLO_COMPOSE},
+            _DEPLOY_PATH,
+        )
+        assert len(actions) == 5
+        assert not questions
+        types = [a["action_type"] for a in actions]
+        assert types == [
+            "CREATE_DIRECTORY",
+            "UPLOAD_FILE",
+            "DOCKER_COMPOSE_CONFIG",
+            "DOCKER_COMPOSE_UP",
+            "DOCKER_COMPOSE_PS",
+        ]
+
+    def test_private_strategy_also_generates_actions(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        actions, questions = _build_deployment_actions(
+            "docker_compose_private",
+            {"compose_content": _HELLO_COMPOSE},
+            _DEPLOY_PATH,
+        )
+        assert len(actions) == 5
+        assert not questions
+
+    def test_non_compose_strategy_returns_empty(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        for strategy in ("manual_required", "reuse_existing_traefik",
+                         "kamal_v2_compatible", "no_public_exposure"):
+            actions, questions = _build_deployment_actions(
+                strategy, {"compose_content": _HELLO_COMPOSE}, _DEPLOY_PATH
+            )
+            assert actions == [], f"Expected [] for strategy={strategy}"
+            assert questions == []
+
+    def test_missing_compose_content_returns_blocking_question(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        actions, questions = _build_deployment_actions(
+            "docker_compose_with_host_port",
+            {},
+            _DEPLOY_PATH,
+        )
+        assert actions == []
+        assert len(questions) == 1
+        assert "compose_content" in questions[0]
+
+    def test_empty_compose_content_returns_blocking_question(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        actions, questions = _build_deployment_actions(
+            "docker_compose_with_host_port",
+            {"compose_content": "   "},
+            _DEPLOY_PATH,
+        )
+        assert actions == []
+        assert questions
+
+    def test_upload_file_path_is_under_deploy_path(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        actions, _ = _build_deployment_actions(
+            "docker_compose_with_host_port",
+            {"compose_content": _HELLO_COMPOSE},
+            _DEPLOY_PATH,
+        )
+        upload = next(a for a in actions if a["action_type"] == "UPLOAD_FILE")
+        path = upload["params"]["path"]
+        assert path.startswith(_DEPLOY_PATH + "/")
+
+    def test_upload_file_content_matches_input(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        actions, _ = _build_deployment_actions(
+            "docker_compose_with_host_port",
+            {"compose_content": _HELLO_COMPOSE},
+            _DEPLOY_PATH,
+        )
+        upload = next(a for a in actions if a["action_type"] == "UPLOAD_FILE")
+        assert upload["params"]["content"] == _HELLO_COMPOSE
+
+    def test_custom_compose_filename_used(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        actions, _ = _build_deployment_actions(
+            "docker_compose_with_host_port",
+            {"compose_content": _HELLO_COMPOSE, "compose_file": "compose.prod.yml"},
+            _DEPLOY_PATH,
+        )
+        upload = next(a for a in actions if a["action_type"] == "UPLOAD_FILE")
+        assert "compose.prod.yml" in upload["params"]["path"]
+        config = next(a for a in actions if a["action_type"] == "DOCKER_COMPOSE_CONFIG")
+        assert config["params"]["compose_file"] == "compose.prod.yml"
+
+    def test_unsafe_compose_filename_falls_back_to_default(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        for bad_name in ("../etc/cron", "../../shadow", "/etc/passwd", "a; rm -rf /"):
+            actions, _ = _build_deployment_actions(
+                "docker_compose_with_host_port",
+                {"compose_content": _HELLO_COMPOSE, "compose_file": bad_name},
+                _DEPLOY_PATH,
+            )
+            upload = next(a for a in actions if a["action_type"] == "UPLOAD_FILE")
+            assert bad_name not in upload["params"]["path"], f"Unsafe name leaked: {bad_name}"
+            assert "docker-compose.yml" in upload["params"]["path"]
+
+    def test_create_directory_uses_deploy_path(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        actions, _ = _build_deployment_actions(
+            "docker_compose_with_host_port",
+            {"compose_content": _HELLO_COMPOSE},
+            _DEPLOY_PATH,
+        )
+        mkdir = next(a for a in actions if a["action_type"] == "CREATE_DIRECTORY")
+        assert mkdir["params"]["path"] == _DEPLOY_PATH
+
+
+class TestGeneratedActionsPassValidator:
+    """Actions generated by _build_deployment_actions must pass the validator."""
+
+    def _make_compose_plan(self, strategy: str = "docker_compose_with_host_port") -> dict:
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        actions, _ = _build_deployment_actions(
+            strategy, {"compose_content": _HELLO_COMPOSE}, _DEPLOY_PATH
+        )
+        return {
+            "strategy": strategy,
+            "risk_level": "low",
+            "summary": "test",
+            "docker_ai": {"provider": "litellm"},
+            "detected_server_state": {"reverse_proxy": "none", "deployment_manager": "none"},
+            "rollback_plan": {
+                "type": "compose_snapshot",
+                "previous_release_ref_required": False,
+                "steps": [],
+            },
+            "secrets_required": [],
+            "blocking_questions": [],
+            "port_plan": {"host_port": 8080},
+            "routing_plan": {},
+            "deployment_actions": actions,
+        }
+
+    def test_action_types_valid(self):
+        from orchestrator.docker_deployment_ai.executor import _validate_actions  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        actions, _ = _build_deployment_actions(
+            "docker_compose_with_host_port",
+            {"compose_content": _HELLO_COMPOSE},
+            _DEPLOY_PATH,
+        )
+        _validate_actions(actions)  # must not raise
+
+    def test_full_validation_passes_with_compose_v2_snapshot(self):
+        from orchestrator.docker_deployment_ai.validator import validate_deployment_plan  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.models import (  # noqa: PLC0415
+            InventorySnapshot, DetectionResult, DeploymentManager, ReverseProxy
+        )
+        plan = self._make_compose_plan()
+        snapshot = InventorySnapshot(
+            target_id="t", project_id="p",
+            docker_binary_info={
+                "docker_binary_present": True,
+                "docker_daemon_reachable": True,
+                "docker_compose_v2_available": True,
+                "docker_info_error": None,
+            },
+            containers=[],
+            detection=DetectionResult(
+                deployment_manager=DeploymentManager.none,
+                reverse_proxy=ReverseProxy.none,
+                confidence=0.6,
+            ),
+        )
+        result = validate_deployment_plan(plan, snapshot)
+        assert result.status in ("passed", "warning"), (
+            f"Unexpected status={result.status}: {result.blocking_errors}"
+        )
+
+    def test_no_forbidden_action_types_generated(self):
+        from orchestrator.docker_deployment_ai.planner import _build_deployment_actions  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.executor import _FORBIDDEN_ACTION_TYPES, _NOT_IMPLEMENTED_ACTIONS  # noqa: PLC0415
+        actions, _ = _build_deployment_actions(
+            "docker_compose_with_host_port",
+            {"compose_content": _HELLO_COMPOSE},
+            _DEPLOY_PATH,
+        )
+        for a in actions:
+            atype = a["action_type"]
+            assert atype not in _FORBIDDEN_ACTION_TYPES, f"Forbidden action generated: {atype}"
+            assert atype not in _NOT_IMPLEMENTED_ACTIONS, f"Not-implemented action generated: {atype}"
+
+
+class TestPlannerE2EWithMockedAI:
+    """Full create_deployment_plan pipeline with mocked AI and in-memory DB."""
+
+    @pytest.mark.asyncio
+    async def test_compose_content_produces_executable_plan(self):
+        """Given compose_content, planner produces a plan with 5 concrete actions."""
+        import json  # noqa: PLC0415
+        import aiosqlite  # noqa: PLC0415
+        from unittest.mock import AsyncMock, patch  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.planner import create_deployment_plan  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.models import (  # noqa: PLC0415
+            InventorySnapshot, DetectionResult, DeploymentManager, ReverseProxy
+        )
+
+        snapshot = InventorySnapshot(
+            target_id="tgt-e2e", project_id="proj-e2e",
+            docker_binary_info={
+                "docker_binary_present": True,
+                "docker_daemon_reachable": True,
+                "docker_compose_v2_available": True,
+                "docker_info_error": None,
+            },
+            containers=[],
+            detection=DetectionResult(
+                deployment_manager=DeploymentManager.none,
+                reverse_proxy=ReverseProxy.none,
+                confidence=0.6,
+            ),
+        )
+        mock_ai = {
+            "provider_used": "litellm",
+            "analysis_id": "analysis-mock",
+            "normalized": {
+                "recommended_strategy": "docker_compose_with_host_port",
+                "risk_level": "low",
+                "reasoning_summary": "Fresh host, compose v2 available.",
+                "blocking_questions": [],
+                "warnings": [],
+            },
+        }
+
+        db = await aiosqlite.connect(":memory:")
+        await db.execute(
+            """CREATE TABLE deployment_plans (
+                id TEXT PRIMARY KEY, project_id TEXT, target_id TEXT,
+                inventory_snapshot_id TEXT, docker_ai_analysis_id TEXT,
+                status TEXT, plan_json TEXT, plan_content_hash TEXT,
+                summary_markdown TEXT, risk_level TEXT,
+                blocking_questions_json TEXT, created_by TEXT, created_at TEXT
+            )"""
+        )
+        await db.execute(
+            """CREATE TABLE docker_ai_analyses (
+                id TEXT PRIMARY KEY, project_id TEXT, target_id TEXT,
+                inventory_snapshot_id TEXT, provider TEXT, analysis_type TEXT,
+                raw_output TEXT, normalized_json TEXT, status TEXT,
+                error_message TEXT, created_at TEXT
+            )"""
+        )
+        await db.commit()
+
+        with patch("orchestrator.docker_deployment_ai.planner.DockerAIProvider") as MP:
+            MP.return_value.recommend_deployment_strategy = AsyncMock(return_value=mock_ai)
+            plan_id, plan = await create_deployment_plan(
+                project_id="proj-e2e",
+                target_id="tgt-e2e",
+                snapshot=snapshot,
+                inventory_snapshot_id="snap-e2e",
+                repo_context={
+                    "app_name": "testapp",
+                    "compose_file": "docker-compose.yml",
+                    "compose_content": _HELLO_COMPOSE,
+                },
+                target_domain=None,
+                preferred_strategy="auto_detect",
+                deploy_path=_DEPLOY_PATH,
+                created_by="test",
+                db=db,
+            )
+
+        assert plan_id
+        actions = plan.get("deployment_actions", [])
+        assert len(actions) == 5, f"Expected 5 actions, got {len(actions)}"
+        types = [a["action_type"] for a in actions]
+        assert types == [
+            "CREATE_DIRECTORY", "UPLOAD_FILE",
+            "DOCKER_COMPOSE_CONFIG", "DOCKER_COMPOSE_UP", "DOCKER_COMPOSE_PS",
+        ]
+        upload = next(a for a in actions if a["action_type"] == "UPLOAD_FILE")
+        assert upload["params"]["content"] == _HELLO_COMPOSE
+        assert upload["params"]["path"].startswith(_DEPLOY_PATH + "/")
+
+        # Verify plan persisted to DB with actions
+        cursor = await db.execute(
+            "SELECT plan_json, risk_level FROM deployment_plans WHERE id=?", (plan_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None
+        db_plan = json.loads(row[0])
+        assert len(db_plan.get("deployment_actions", [])) == 5
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_missing_compose_content_produces_blocked_plan(self):
+        """When compose_content is absent, plan has empty actions and a blocking question."""
+        import aiosqlite  # noqa: PLC0415
+        from unittest.mock import AsyncMock, patch  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.planner import create_deployment_plan  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.models import (  # noqa: PLC0415
+            InventorySnapshot, DetectionResult, DeploymentManager, ReverseProxy
+        )
+
+        snapshot = InventorySnapshot(
+            target_id="tgt-e2e", project_id="proj-e2e",
+            docker_binary_info={
+                "docker_binary_present": True,
+                "docker_compose_v2_available": True,
+            },
+            containers=[],
+            detection=DetectionResult(
+                deployment_manager=DeploymentManager.none,
+                reverse_proxy=ReverseProxy.none,
+                confidence=0.6,
+            ),
+        )
+        mock_ai = {
+            "provider_used": "litellm", "analysis_id": None,
+            "normalized": {
+                "recommended_strategy": "docker_compose_with_host_port",
+                "risk_level": "low", "reasoning_summary": "Fresh host.",
+                "blocking_questions": [], "warnings": [],
+            },
+        }
+
+        db = await aiosqlite.connect(":memory:")
+        await db.execute(
+            """CREATE TABLE deployment_plans (
+                id TEXT PRIMARY KEY, project_id TEXT, target_id TEXT,
+                inventory_snapshot_id TEXT, docker_ai_analysis_id TEXT,
+                status TEXT, plan_json TEXT, plan_content_hash TEXT,
+                summary_markdown TEXT, risk_level TEXT,
+                blocking_questions_json TEXT, created_by TEXT, created_at TEXT
+            )"""
+        )
+        await db.execute(
+            """CREATE TABLE docker_ai_analyses (
+                id TEXT PRIMARY KEY, project_id TEXT, target_id TEXT,
+                inventory_snapshot_id TEXT, provider TEXT, analysis_type TEXT,
+                raw_output TEXT, normalized_json TEXT, status TEXT,
+                error_message TEXT, created_at TEXT
+            )"""
+        )
+        await db.commit()
+
+        with patch("orchestrator.docker_deployment_ai.planner.DockerAIProvider") as MP:
+            MP.return_value.recommend_deployment_strategy = AsyncMock(return_value=mock_ai)
+            plan_id, plan = await create_deployment_plan(
+                project_id="proj-e2e",
+                target_id="tgt-e2e",
+                snapshot=snapshot,
+                inventory_snapshot_id="snap-e2e",
+                repo_context={"app_name": "testapp"},  # no compose_content
+                target_domain=None,
+                preferred_strategy="auto_detect",
+                deploy_path=_DEPLOY_PATH,
+                created_by="test",
+                db=db,
+            )
+
+        assert plan.get("deployment_actions", []) == [], (
+            "Actions must be empty when compose_content missing"
+        )
+        questions = plan.get("blocking_questions", [])
+        assert any("compose_content" in q for q in questions), (
+            f"Expected blocking question, got: {questions}"
+        )
+        await db.close()

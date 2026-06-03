@@ -30,7 +30,10 @@ _ALLOWED_COMMANDS: frozenset[str] = frozenset(
         # Host info
         "hostname", "uname -a", "cat /etc/os-release", "nproc",
         "free -b", "df -B1", "whoami", "id",
-        # Docker
+        # Docker binary / daemon checks
+        "which docker", "docker --version",
+        "docker compose version",
+        # Docker daemon info (requires running daemon; may return non-zero)
         "docker version --format json", "docker info --format json",
         "docker ps -a --format json", "docker ps --format json",
         "docker images --format json",

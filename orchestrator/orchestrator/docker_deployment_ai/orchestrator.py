@@ -233,6 +233,7 @@ class DockerDeploymentOrchestrator:
                 repo_context=repo_context,
                 target_domain=desired_domain,
                 preferred_strategy=preferred_strategy,
+                deploy_path=target.deploy_path,
                 created_by=created_by,
                 db=db,
             )
@@ -312,11 +313,25 @@ class DockerDeploymentOrchestrator:
 
     # ---- Approval ----
 
-    async def _check_validation_passed(self, plan_id: str, plan_hash: str, db: aiosqlite.Connection) -> tuple[bool, str]:
-        """Return (ok, error_msg). Fails if no passing validation exists for current plan hash."""
+    async def _check_validation_allows_execution(
+        self, plan_id: str, plan_hash: str, db: aiosqlite.Connection
+    ) -> tuple[bool, str]:
+        """Return (ok, error_msg).
+
+        Execution is allowed when:
+          - A validation result exists for this plan_id.
+          - The latest result has status 'passed' OR status 'warning' with no
+            blocking_errors (warnings are non-blocking issues only).
+          - The plan_content_hash matches the current plan (no mutation since validation).
+
+        Status 'blocked' always refuses execution regardless of blocking_errors content.
+        Status 'warning' with any blocking_errors also refuses — that state should not
+        occur by design (validator sets 'blocked' when blocking_errors is non-empty)
+        but we guard defensively.
+        """
         cursor = await db.execute(
             """
-            SELECT status, plan_content_hash
+            SELECT status, plan_content_hash, blocking_errors_json
             FROM deployment_plan_validations
             WHERE plan_id = ?
             ORDER BY created_at DESC LIMIT 1
@@ -329,18 +344,41 @@ class DockerDeploymentOrchestrator:
                 "No validation result found for this plan. "
                 "Call POST /deployment-plans/{plan_id}/validate before executing."
             )
-        status, validated_hash = row
-        if status != "passed":
+        status, validated_hash, blocking_errors_json = row
+
+        if status == "blocked":
             return False, (
-                f"Latest validation status is '{status}' — execution requires 'passed'. "
-                "Resolve all blocking errors and re-validate."
+                "Latest validation status is 'blocked' — execution requires 'passed' "
+                "or 'warning' (with no blocking errors). Resolve all blocking errors "
+                "and re-validate."
             )
+
+        if status == "warning":
+            import json as _json  # noqa: PLC0415
+            blocking_errors: list[str] = _json.loads(blocking_errors_json or "[]")
+            if blocking_errors:
+                # Defensive: warning + blocking_errors is an inconsistent state.
+                # Refuse execution so the operator re-validates with a clean result.
+                return False, (
+                    "Validation status is 'warning' but blocking errors are present. "
+                    "Re-validate to obtain a consistent result before executing."
+                )
+
+        if status not in ("passed", "warning"):
+            return False, (
+                f"Latest validation status is '{status}' — execution requires "
+                "'passed' or 'warning' with no blocking errors."
+            )
+
         if validated_hash and validated_hash != plan_hash:
             return False, (
                 "Plan content has changed since validation was run. "
                 "Re-validate the current plan before executing."
             )
         return True, ""
+
+    # Keep old name as alias so any existing callers (tests) still work.
+    _check_validation_passed = _check_validation_allows_execution
 
     async def approve_plan(
         self,
@@ -405,39 +443,55 @@ class DockerDeploymentOrchestrator:
             )
         return True, ""
 
-    async def execute_plan(
+    async def prepare_run(
         self,
         plan_id: str,
         started_by: str,
         db: aiosqlite.Connection,
     ) -> dict[str, Any]:
+        """Run all pre-execution gates and create the deploy_runs row.
+
+        This is the SYNCHRONOUS part of execution — it must complete before the
+        API response is sent so the returned run_id is immediately readable.
+
+        Returns one of:
+          {"run_id": ..., "plan": ..., "target": ..., "project_id": ..., "plan_id": ...}
+            — gates passed, run row committed to DB.
+          {"status": "rejected", "error": ..., "http_status": 409}
+            — a gate failed; no row was created.
+        """
         plan_data = await self.get_plan(plan_id, db)
         if not plan_data:
-            return {"error": f"Plan {plan_id} not found"}
+            return {"status": "rejected", "error": f"Plan {plan_id} not found",
+                    "http_status": 404}
 
         plan = plan_data.get("plan_json") or {}
         target_id = plan_data.get("target_id")
         project_id = plan_data.get("project_id", "")
         target = await get_target(db, target_id) if target_id else None
         if not target:
-            return {"error": "Deployment target not found"}
+            return {"status": "rejected", "error": "Deployment target not found",
+                    "http_status": 404}
 
-        # P0-3: enforce that validation has been run and passed
+        # P0-3: validation gate
         plan_hash = compute_plan_hash(plan)
-        valid_ok, valid_err = await self._check_validation_passed(plan_id, plan_hash, db)
+        valid_ok, valid_err = await self._check_validation_allows_execution(plan_id, plan_hash, db)
         if not valid_ok:
-            return {"status": "rejected", "error": valid_err}
+            return {"status": "rejected", "error": valid_err, "http_status": 409}
 
-        # P0-4: enforce that approval exists and matches current plan hash
+        # P0-4: approval hash gate
         approved_ok, approved_err = await self._check_approved_hash(plan_id, plan_hash, db)
         if not approved_ok:
-            return {"status": "rejected", "error": approved_err}
+            return {"status": "rejected", "error": approved_err, "http_status": 409}
 
-        # Extra gate: risk level must not be blocked
+        # Risk level gate
         if plan.get("risk_level") == "blocked":
-            return {"status": "rejected", "error": "Plan has risk_level=blocked and cannot be executed."}
+            return {"status": "rejected",
+                    "error": "Plan has risk_level=blocked and cannot be executed.",
+                    "http_status": 409}
 
-        # Create the run row
+        # Create run row — committed before this method returns so the run_id
+        # is readable by any concurrent GET before execution starts.
         run_id = str(uuid.uuid4())
         now = _now()
         await db.execute(
@@ -450,7 +504,33 @@ class DockerDeploymentOrchestrator:
              plan_id, target_id, started_by, now, "unknown"),
         )
         await db.commit()
+        logger.info(
+            "Execution prepared: run_id=%s plan_id=%s started_by=%s",
+            run_id, plan_id, started_by,
+        )
+        return {
+            "run_id": run_id,
+            "plan": plan,
+            "plan_id": plan_id,
+            "target": target,
+            "project_id": project_id,
+        }
 
+    async def execute_prepared_run(
+        self,
+        run_id: str,
+        plan: dict[str, Any],
+        plan_id: str,
+        target: Any,
+        project_id: str,
+        started_by: str,
+        db: aiosqlite.Connection,
+    ) -> dict[str, Any]:
+        """Execute a run whose row was already created by prepare_run.
+
+        This is the BACKGROUND part of execution — SSH calls, rollback capture,
+        healthcheck. The run row already exists in DB when this method starts.
+        """
         # Capture rollback metadata before execution (best-effort; non-blocking)
         try:
             await capture_rollback_metadata(
@@ -469,7 +549,7 @@ class DockerDeploymentOrchestrator:
             db=db,
         )
 
-        # Run healthcheck asynchronously after successful execution
+        # Healthcheck after successful execution
         if result.get("status") == "completed":
             try:
                 await run_healthcheck(
@@ -483,6 +563,33 @@ class DockerDeploymentOrchestrator:
                 logger.warning("Healthcheck failed: %s", exc)
 
         return {"run_id": run_id, **result}
+
+    async def execute_plan(
+        self,
+        plan_id: str,
+        started_by: str,
+        db: aiosqlite.Connection,
+        *,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Legacy single-method execute — kept for backwards compatibility with tests.
+
+        New callers should use prepare_run + execute_prepared_run.
+        """
+        prep = await self.prepare_run(plan_id, started_by, db)
+        if "error" in prep:
+            return {"status": prep.get("status", "rejected"), "error": prep["error"]}
+        # If an external run_id was supplied (old API path), ignore it and use the
+        # one created by prepare_run — the row already exists at that id.
+        return await self.execute_prepared_run(
+            run_id=prep["run_id"],
+            plan=prep["plan"],
+            plan_id=prep["plan_id"],
+            target=prep["target"],
+            project_id=prep["project_id"],
+            started_by=started_by,
+            db=db,
+        )
 
     # ---- Run queries ----
 

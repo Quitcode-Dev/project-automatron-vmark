@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -91,6 +92,68 @@ def _strategy_from_detection(
     return "manual_required", "blocked", questions
 
 
+# Compose strategies that support deterministic action generation.
+_COMPOSE_STRATEGIES: frozenset[str] = frozenset([
+    "docker_compose_with_host_port",
+    "docker_compose_private",
+])
+
+# Safe compose filename: alphanumeric/dash/underscore start, .yml or .yaml suffix.
+_SAFE_COMPOSE_FILENAME_RE = re.compile(r"^[\w][\w.\-]*\.ya?ml$", re.ASCII)
+
+
+def _build_deployment_actions(
+    strategy: str,
+    repo_context: dict[str, Any],
+    deploy_path: str,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Build concrete deployment_actions for compose-based strategies.
+
+    Returns (actions, additional_blocking_questions).
+
+    Non-compose strategies (manual_required, abort, traefik variants, etc.)
+    return ([], []) — caller should not generate actions for them.
+
+    Compose strategies require repo_context["compose_content"] to be present.
+    If absent, returns ([], [blocking_question]) so the operator knows exactly
+    what to supply. The planner never invents compose file content.
+    """
+    if strategy not in _COMPOSE_STRATEGIES:
+        return [], []
+
+    # Sanitise compose filename — reject traversal, shell chars, absolute paths.
+    raw_filename = (repo_context.get("compose_file") or "docker-compose.yml").strip()
+    if not _SAFE_COMPOSE_FILENAME_RE.match(raw_filename):
+        raw_filename = "docker-compose.yml"
+    compose_file = raw_filename
+
+    compose_content: str = repo_context.get("compose_content") or ""
+    if not compose_content.strip():
+        return [], [
+            f"'compose_content' is required in repo_context to generate deployment "
+            f"actions. Provide the full content of {compose_file!r} so the planner "
+            "can produce the UPLOAD_FILE action without inventing file content."
+        ]
+
+    deploy_dir = deploy_path.rstrip("/")
+    remote_compose_path = f"{deploy_dir}/{compose_file}"
+
+    actions: list[dict[str, Any]] = [
+        {"action_type": "CREATE_DIRECTORY", "params": {"path": deploy_dir}},
+        {
+            "action_type": "UPLOAD_FILE",
+            "params": {"path": remote_compose_path, "content": compose_content},
+        },
+        {"action_type": "DOCKER_COMPOSE_CONFIG", "params": {"compose_file": compose_file}},
+        {
+            "action_type": "DOCKER_COMPOSE_UP",
+            "params": {"compose_file": compose_file, "service": ""},
+        },
+        {"action_type": "DOCKER_COMPOSE_PS", "params": {"compose_file": compose_file}},
+    ]
+    return actions, []
+
+
 def _build_plan(
     strategy: str,
     risk_level: str,
@@ -98,6 +161,7 @@ def _build_plan(
     snapshot: InventorySnapshot,
     target_domain: str | None,
     blocking_questions: list[str],
+    deployment_actions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     detection = snapshot.detection
     ai_normalized = docker_ai_result.get("normalized") or {}
@@ -151,11 +215,14 @@ def _build_plan(
         "networks": [],
         "secrets_required": list(ai_normalized.get("required_files") or []),
         "preflight_checks": [],
-        "deployment_actions": [],
+        "deployment_actions": deployment_actions or [],
         "healthchecks": [],
         "rollback_plan": {
             "type": "compose_snapshot",
-            "previous_release_ref_required": True,
+            # False: rollback execution is disabled in this version; setting True
+            # would trigger a non-blocking validator warning on first deploy that
+            # blocks execution via the validation gate.
+            "previous_release_ref_required": False,
             "steps": [],
         },
         "blocking_questions": all_questions,
@@ -171,6 +238,7 @@ async def create_deployment_plan(
     repo_context: dict[str, Any],
     target_domain: str | None,
     preferred_strategy: str,
+    deploy_path: str = "",
     created_by: str | None,
     db: aiosqlite.Connection,
 ) -> tuple[str, dict[str, Any]]:
@@ -218,6 +286,30 @@ async def create_deployment_plan(
         ai_risk = ai_norm.get("risk_level") or risk_level
         risk_order = {"low": 0, "medium": 1, "high": 2, "blocked": 3}
         risk_level = max(risk_level, ai_risk, key=lambda r: risk_order.get(r, 1))
+    elif preferred_strategy != "auto_detect" and not ai_result.get("error"):
+        # For explicit strategy, respect AI risk up to "high" — but do NOT let AI
+        # block a strategy the operator chose explicitly. AI blocking questions are
+        # still collected (they appear in _build_plan via ai_norm). If the AI is
+        # truly concerned it can raise "high" which surfaces as a warning.
+        ai_risk = ai_norm.get("risk_level") or "medium"
+        risk_order = {"low": 0, "medium": 1, "high": 2, "blocked": 3}
+        capped_ai_risk = ai_risk if ai_risk != "blocked" else "high"
+        risk_level = max(risk_level, capped_ai_risk, key=lambda r: risk_order.get(r, 1))
+
+    # Deterministically generate deployment_actions from strategy + repo_context.
+    # This happens AFTER strategy is finalised so the right action set is chosen.
+    # Never happens when risk_level is already blocked (no point building actions
+    # for a plan that cannot be executed).
+    deployment_actions: list[dict[str, Any]] = []
+    if risk_level != "blocked" and deploy_path:
+        actions, action_questions = _build_deployment_actions(
+            strategy, repo_context, deploy_path
+        )
+        deployment_actions = actions
+        # Merge action blocking questions into the plan-level list
+        for q in action_questions:
+            if q not in blocking_questions:
+                blocking_questions.append(q)
 
     plan = _build_plan(
         strategy=strategy,
@@ -226,6 +318,7 @@ async def create_deployment_plan(
         snapshot=snapshot,
         target_domain=target_domain,
         blocking_questions=blocking_questions,
+        deployment_actions=deployment_actions,
     )
 
     # Schema validation

@@ -898,21 +898,50 @@ async def api_execute_deployment_plan(
     background_tasks: BackgroundTasks,
     session: dict = Depends(_require_auth),
 ) -> dict[str, Any]:
+    # Ownership check — must happen before gates so we return 403, not 409.
     db_check = await _get_deployment_db()
     try:
         await _require_plan_access(plan_id, db_check)
     finally:
         await db_check.close()
 
+    # Run all pre-execution gates and create the run row SYNCHRONOUSLY so the
+    # returned run_id is immediately readable via GET /deployment-runs/{run_id}.
+    # Gate failures (missing approval, stale hash, blocked plan) return 409 here,
+    # never inside the background task.
+    db_prep = await _get_deployment_db()
+    try:
+        prep = await _deployment_orch.prepare_run(
+            plan_id, session.get("email", "unknown"), db_prep
+        )
+    finally:
+        await db_prep.close()
+
+    if "error" in prep:
+        http_status = prep.get("http_status", 409)
+        raise HTTPException(status_code=http_status, detail=prep["error"])
+
+    run_id = prep["run_id"]
+    started_by = session.get("email", "unknown")
+
+    # Background task: actual SSH execution using the already-created run row.
     async def _run() -> None:
         db = await _get_deployment_db()
         try:
-            await _deployment_orch.execute_plan(plan_id, session.get("email", "unknown"), db)
+            await _deployment_orch.execute_prepared_run(
+                run_id=run_id,
+                plan=prep["plan"],
+                plan_id=prep["plan_id"],
+                target=prep["target"],
+                project_id=prep["project_id"],
+                started_by=started_by,
+                db=db,
+            )
         finally:
             await db.close()
 
     background_tasks.add_task(_run)
-    return {"status": "started", "plan_id": plan_id}
+    return {"status": "started", "plan_id": plan_id, "run_id": run_id}
 
 
 @router.get("/deployment-runs/{run_id}")
@@ -955,9 +984,8 @@ async def api_rollback_deployment_run(
     raise HTTPException(
         status_code=501,
         detail=(
-            "Rollback is not implemented in this version. "
-            "Rollback metadata is captured but execution is disabled until "
-            "UPLOAD_FILE and WRITE_ENV_FILE actions are implemented. "
-            "See known P1 items."
+            "Rollback execution is not implemented yet. "
+            "Rollback metadata is captured, but previous compose/env restoration "
+            "and rollback healthcheck are disabled in this version."
         ),
     )

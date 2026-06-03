@@ -619,3 +619,425 @@ class TestPlanHashDeterminism:
         plan_a = {"risk_level": "medium", "strategy": "kamal_v2_compatible"}
         plan_b = {"strategy": "kamal_v2_compatible", "risk_level": "medium"}
         assert compute_plan_hash(plan_a) == compute_plan_hash(plan_b)
+
+
+# ---------------------------------------------------------------------------
+# Hardening — execute returns run_id
+# ---------------------------------------------------------------------------
+
+class TestExecuteReturnsRunId:
+    """POST /execute must return a run_id so the client can poll status."""
+
+    @pytest.mark.asyncio
+    async def test_execute_plan_returns_run_id(self):
+        """DockerDeploymentOrchestrator.execute_plan must include run_id in result."""
+        import json  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.plan_hash import compute_plan_hash  # noqa: PLC0415
+
+        db = await _make_db()
+        orch = DockerDeploymentOrchestrator()
+
+        # Insert project, target, plan, validation, approval
+        await db.execute(
+            "INSERT INTO projects (id, name) VALUES ('proj-1','test')"
+        )
+        await db.execute(
+            """INSERT INTO deployment_targets
+            (id, project_id, name, host, ssh_user, app_name, deploy_path, created_at, updated_at)
+            VALUES ('tgt-1','proj-1','server','1.2.3.4','deploy','app','/opt/app','2024-01-01','2024-01-01')"""
+        )
+        plan_dict = {
+            "strategy": "docker_compose_with_host_port",
+            "risk_level": "low",
+            "deployment_actions": [],
+        }
+        plan_json = json.dumps(plan_dict)
+        plan_hash = compute_plan_hash(plan_dict)
+        await db.execute(
+            """INSERT INTO deployment_plans
+            (id, project_id, target_id, status, plan_json, plan_content_hash,
+             risk_level, blocking_questions_json, created_at)
+            VALUES ('plan-1','proj-1','tgt-1','approved',?,?,'low','[]','2024-01-01')""",
+            (plan_json, plan_hash),
+        )
+        await db.execute(
+            """INSERT INTO deployment_plan_validations
+            (id, plan_id, status, plan_content_hash, checks_json,
+             blocking_errors_json, warnings_json, created_at)
+            VALUES ('val-1','plan-1','passed',?,
+                    '[]','[]','[]','2024-01-01')""",
+            (plan_hash,),
+        )
+        await db.execute(
+            """INSERT INTO deployment_approvals
+            (id, plan_id, plan_content_hash, approved_by, approved_at)
+            VALUES ('appr-1','plan-1',?,'tester@test.com','2024-01-01')""",
+            (plan_hash,),
+        )
+        await db.commit()
+
+        with patch(
+            "orchestrator.docker_deployment_ai.orchestrator.execute_plan",
+            AsyncMock(return_value={"status": "completed", "steps_completed": 0}),
+        ), patch(
+            "orchestrator.docker_deployment_ai.orchestrator.run_healthcheck",
+            AsyncMock(),
+        ), patch(
+            "orchestrator.docker_deployment_ai.orchestrator.capture_rollback_metadata",
+            AsyncMock(),
+        ), patch(
+            "orchestrator.docker_deployment_ai.orchestrator.emit_approved",
+            AsyncMock(),
+        ):
+            result = await orch.execute_plan("plan-1", "tester@test.com", db)
+
+        assert "run_id" in result, "execute_plan must return run_id"
+        assert result["run_id"]  # must be non-empty string
+        assert result["status"] == "completed"
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_prepare_run_creates_row_before_returning(self):
+        """prepare_run must commit the run row to DB before it returns, so the
+        run_id is immediately readable — no background task required."""
+        import json  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.plan_hash import compute_plan_hash  # noqa: PLC0415
+
+        db = await _make_db()
+        orch = DockerDeploymentOrchestrator()
+
+        await db.execute("INSERT INTO projects (id, name) VALUES ('proj-1','test')")
+        await db.execute(
+            """INSERT INTO deployment_targets
+            (id, project_id, name, host, ssh_user, app_name, deploy_path, created_at, updated_at)
+            VALUES ('tgt-1','proj-1','server','1.2.3.4','deploy','app','/opt/app','2024-01-01','2024-01-01')"""
+        )
+        plan_dict = {"strategy": "docker_compose_with_host_port", "risk_level": "low",
+                     "deployment_actions": []}
+        plan_json = json.dumps(plan_dict)
+        plan_hash = compute_plan_hash(plan_dict)
+        await db.execute(
+            """INSERT INTO deployment_plans
+            (id, project_id, target_id, status, plan_json, plan_content_hash,
+             risk_level, blocking_questions_json, created_at)
+            VALUES ('plan-2','proj-1','tgt-1','approved',?,?,'low','[]','2024-01-01')""",
+            (plan_json, plan_hash),
+        )
+        await db.execute(
+            """INSERT INTO deployment_plan_validations
+            (id, plan_id, status, plan_content_hash, checks_json,
+             blocking_errors_json, warnings_json, created_at)
+            VALUES ('val-2','plan-2','passed',?,'[]','[]','[]','2024-01-01')""",
+            (plan_hash,),
+        )
+        await db.execute(
+            """INSERT INTO deployment_approvals
+            (id, plan_id, plan_content_hash, approved_by, approved_at)
+            VALUES ('appr-2','plan-2',?,'tester@test.com','2024-01-01')""",
+            (plan_hash,),
+        )
+        await db.commit()
+
+        prep = await orch.prepare_run("plan-2", "tester@test.com", db)
+
+        # prepare_run must not return an error
+        assert "error" not in prep, f"prepare_run failed: {prep.get('error')}"
+        run_id = prep["run_id"]
+        assert run_id
+
+        # The run row MUST exist in the DB before we even start the background task.
+        cursor = await db.execute(
+            "SELECT id, status FROM deploy_runs WHERE id=?", (run_id,)
+        )
+        row = await cursor.fetchone()
+        assert row is not None, (
+            "deploy_runs row must be committed before prepare_run returns — "
+            "client must be able to GET the run immediately after receiving run_id."
+        )
+        assert row[1] == "pending"
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_prepare_run_missing_approval_returns_error_not_row(self):
+        """prepare_run must return an error (not create a row) when approval is absent."""
+        import json  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.plan_hash import compute_plan_hash  # noqa: PLC0415
+
+        db = await _make_db()
+        orch = DockerDeploymentOrchestrator()
+
+        await db.execute("INSERT INTO projects (id, name) VALUES ('proj-1','test')")
+        await db.execute(
+            """INSERT INTO deployment_targets
+            (id, project_id, name, host, ssh_user, app_name, deploy_path, created_at, updated_at)
+            VALUES ('tgt-1','proj-1','server','1.2.3.4','deploy','app','/opt/app','2024-01-01','2024-01-01')"""
+        )
+        plan_dict = {"strategy": "docker_compose_with_host_port", "risk_level": "low",
+                     "deployment_actions": []}
+        plan_json = json.dumps(plan_dict)
+        plan_hash = compute_plan_hash(plan_dict)
+        await db.execute(
+            """INSERT INTO deployment_plans
+            (id, project_id, target_id, status, plan_json, plan_content_hash,
+             risk_level, blocking_questions_json, created_at)
+            VALUES ('plan-3','proj-1','tgt-1','draft',?,?,'low','[]','2024-01-01')""",
+            (plan_json, plan_hash),
+        )
+        await db.execute(
+            """INSERT INTO deployment_plan_validations
+            (id, plan_id, status, plan_content_hash, checks_json,
+             blocking_errors_json, warnings_json, created_at)
+            VALUES ('val-3','plan-3','passed',?,'[]','[]','[]','2024-01-01')""",
+            (plan_hash,),
+        )
+        # No approval row inserted
+        await db.commit()
+
+        prep = await orch.prepare_run("plan-3", "tester@test.com", db)
+
+        assert "error" in prep, "prepare_run must return error when approval missing"
+        assert prep.get("status") == "rejected"
+        assert prep.get("http_status") == 409
+
+        # No run row must have been created
+        cursor = await db.execute("SELECT count(*) FROM deploy_runs")
+        count = (await cursor.fetchone())[0]
+        assert count == 0, "No run row must be created when gate fails"
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Hardening — rollback 501 message updated
+# ---------------------------------------------------------------------------
+
+class TestRollback501MessageUpdated:
+    """The rollback 501 message must no longer reference UPLOAD_FILE/WRITE_ENV_FILE."""
+
+    @pytest.mark.asyncio
+    async def test_execute_rollback_message_updated(self):
+        from orchestrator.docker_deployment_ai.rollback import execute_rollback  # noqa: PLC0415
+        db = await _make_db()
+        target = MagicMock()
+        target.host = "1.2.3.4"
+        target.ssh_user = "deploy"
+        target.ssh_port = 22
+        target.auth_mode = "ssh_key"
+        target.auth_reference = None
+        try:
+            result = await execute_rollback(
+                run_id="run-x", project_id="proj-x", target=target, db=db
+            )
+            error_msg = result["error"].lower()
+            assert "not implemented" in error_msg
+            assert "upload_file" not in error_msg, (
+                "Rollback error message must not reference UPLOAD_FILE — "
+                "that action is now implemented."
+            )
+            assert "write_env_file" not in error_msg, (
+                "Rollback error message must not reference WRITE_ENV_FILE — "
+                "that action is now implemented."
+            )
+            assert "compose" in error_msg or "restoration" in error_msg
+        finally:
+            await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Production guardrails — validation warning semantics
+# ---------------------------------------------------------------------------
+
+class TestValidationWarningSemanticsForExecution:
+    """_check_validation_allows_execution must treat 'warning' as executable
+    only when blocking_errors is empty.
+
+    Rules:
+      status='passed',  blocking_errors=[]  → executable
+      status='warning', blocking_errors=[]  → executable
+      status='warning', blocking_errors=[…] → NOT executable (inconsistent state)
+      status='blocked', blocking_errors=[]  → NOT executable
+      status='blocked', blocking_errors=[…] → NOT executable
+    """
+
+    async def _make_plan_with_validation(
+        self,
+        db,
+        *,
+        val_status: str,
+        blocking_errors: list,
+    ):
+        import json  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.plan_hash import compute_plan_hash  # noqa: PLC0415
+        plan_dict = {"strategy": "docker_compose_private", "risk_level": "low",
+                     "deployment_actions": []}
+        plan_json = json.dumps(plan_dict)
+        plan_hash = compute_plan_hash(plan_dict)
+        await db.execute(
+            """INSERT INTO deployment_plans
+            (id, project_id, target_id, status, plan_json, plan_content_hash,
+             risk_level, blocking_questions_json, created_at)
+            VALUES ('plan-w','proj-w','tgt-w','draft',?,?,'low','[]','2024-01-01')""",
+            (plan_json, plan_hash),
+        )
+        await db.execute(
+            """INSERT INTO deployment_plan_validations
+            (id, plan_id, status, plan_content_hash, checks_json,
+             blocking_errors_json, warnings_json, created_at)
+            VALUES ('val-w','plan-w',?,?,'[]',?,?,'2024-01-01')""",
+            (val_status, plan_hash, json.dumps(blocking_errors), "[]"),
+        )
+        await db.commit()
+        return plan_hash
+
+    @pytest.mark.asyncio
+    async def test_passed_no_blocking_errors_is_executable(self):
+        from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.plan_hash import compute_plan_hash  # noqa: PLC0415
+        import json  # noqa: PLC0415
+        db = await _make_db()
+        plan_dict = {"strategy": "docker_compose_private", "risk_level": "low",
+                     "deployment_actions": []}
+        plan_hash = await self._make_plan_with_validation(
+            db, val_status="passed", blocking_errors=[]
+        )
+        orch = DockerDeploymentOrchestrator()
+        ok, err = await orch._check_validation_allows_execution("plan-w", plan_hash, db)
+        assert ok, f"Expected executable for status=passed, got: {err}"
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_warning_no_blocking_errors_is_executable(self):
+        """status='warning' with no blocking errors must allow execution."""
+        from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: PLC0415
+        db = await _make_db()
+        plan_hash = await self._make_plan_with_validation(
+            db, val_status="warning", blocking_errors=[]
+        )
+        orch = DockerDeploymentOrchestrator()
+        ok, err = await orch._check_validation_allows_execution("plan-w", plan_hash, db)
+        assert ok, f"Expected executable for status=warning+no-errors, got: {err}"
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_warning_with_blocking_errors_is_not_executable(self):
+        """status='warning' with blocking_errors present is an inconsistent state
+        and must refuse execution."""
+        from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: PLC0415
+        db = await _make_db()
+        plan_hash = await self._make_plan_with_validation(
+            db, val_status="warning",
+            blocking_errors=["Some blocking error that should not be here"]
+        )
+        orch = DockerDeploymentOrchestrator()
+        ok, err = await orch._check_validation_allows_execution("plan-w", plan_hash, db)
+        assert not ok, "Must refuse when warning+blocking_errors (inconsistent state)"
+        assert "blocking error" in err.lower() or "inconsistent" in err.lower()
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_blocked_status_is_never_executable(self):
+        """status='blocked' must always refuse execution."""
+        from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: PLC0415
+        db = await _make_db()
+        plan_hash = await self._make_plan_with_validation(
+            db, val_status="blocked", blocking_errors=["Port 80 in use"]
+        )
+        orch = DockerDeploymentOrchestrator()
+        ok, err = await orch._check_validation_allows_execution("plan-w", plan_hash, db)
+        assert not ok, "status=blocked must always refuse"
+        assert "blocked" in err.lower()
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_blocked_with_no_errors_is_still_not_executable(self):
+        """Even if blocking_errors is empty, status='blocked' still refuses."""
+        from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: PLC0415
+        db = await _make_db()
+        plan_hash = await self._make_plan_with_validation(
+            db, val_status="blocked", blocking_errors=[]
+        )
+        orch = DockerDeploymentOrchestrator()
+        ok, _ = await orch._check_validation_allows_execution("plan-w", plan_hash, db)
+        assert not ok, "status=blocked must always refuse regardless of blocking_errors"
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Production guardrails — run_id immediately readable after execute
+# ---------------------------------------------------------------------------
+
+class TestRunIdImmediatelyReadable:
+    """After POST execute returns run_id, GET /deployment-runs/{run_id} must
+    return 200 immediately — never 404. The run row must exist before execution
+    starts, not after it completes."""
+
+    @pytest.mark.asyncio
+    async def test_run_row_exists_immediately_after_prepare_run(self):
+        """prepare_run commits the row; no background task needed for readability."""
+        import json  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: PLC0415
+        from orchestrator.docker_deployment_ai.plan_hash import compute_plan_hash  # noqa: PLC0415
+
+        db = await _make_db()
+        orch = DockerDeploymentOrchestrator()
+
+        await db.execute("INSERT INTO projects (id, name) VALUES ('p','test')")
+        await db.execute(
+            """INSERT INTO deployment_targets
+            (id, project_id, name, host, ssh_user, app_name, deploy_path, created_at, updated_at)
+            VALUES ('t','p','s','1.2.3.4','deploy','app','/opt/app','2024-01-01','2024-01-01')"""
+        )
+        plan_dict = {"strategy": "docker_compose_private", "risk_level": "low",
+                     "deployment_actions": []}
+        plan_json = json.dumps(plan_dict)
+        plan_hash = compute_plan_hash(plan_dict)
+        await db.execute(
+            """INSERT INTO deployment_plans
+            (id, project_id, target_id, status, plan_json, plan_content_hash,
+             risk_level, blocking_questions_json, created_at)
+            VALUES ('pl','p','t','approved',?,?,'low','[]','2024-01-01')""",
+            (plan_json, plan_hash),
+        )
+        await db.execute(
+            """INSERT INTO deployment_plan_validations
+            (id, plan_id, status, plan_content_hash, checks_json,
+             blocking_errors_json, warnings_json, created_at)
+            VALUES ('vl','pl','passed',?,'[]','[]','[]','2024-01-01')""",
+            (plan_hash,),
+        )
+        await db.execute(
+            """INSERT INTO deployment_approvals
+            (id, plan_id, plan_content_hash, approved_by, approved_at)
+            VALUES ('ap','pl',?,'u','2024-01-01')""",
+            (plan_hash,),
+        )
+        await db.commit()
+
+        prep = await orch.prepare_run("pl", "user@test.com", db)
+        assert "error" not in prep, f"prepare_run failed: {prep}"
+
+        run_id = prep["run_id"]
+
+        # Simulate what GET /deployment-runs/{run_id} does — must find the row.
+        run_data = await orch.get_run(run_id, db)
+        assert run_data is not None, (
+            f"GET /deployment-runs/{run_id} would return 404 — "
+            "run row must exist before background task starts."
+        )
+        assert run_data["status"] == "pending"
+        await db.close()
+
+    @pytest.mark.asyncio
+    async def test_gate_failure_returns_no_run_row(self):
+        """When gates fail, prepare_run returns an error and creates no DB row."""
+        from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator  # noqa: PLC0415
+        db = await _make_db()
+        orch = DockerDeploymentOrchestrator()
+        # Non-existent plan
+        prep = await orch.prepare_run("no-such-plan", "user@test.com", db)
+        assert "error" in prep
+        cursor = await db.execute("SELECT count(*) FROM deploy_runs")
+        assert (await cursor.fetchone())[0] == 0
+        await db.close()

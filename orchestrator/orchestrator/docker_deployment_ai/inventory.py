@@ -119,6 +119,48 @@ def _collect_containers(client: SSHClient) -> list[ContainerInfo]:
     return enriched
 
 
+def _collect_docker_binary_info(client: SSHClient) -> dict[str, Any]:
+    """Probe Docker binary and Compose v2 availability — independent of the daemon.
+
+    Returns a dict with four boolean/string fields:
+      docker_binary_present    — `which docker` found the binary
+      docker_daemon_reachable  — `docker info` succeeded (daemon up + accessible)
+      docker_compose_v2_available — `docker compose version` succeeded
+      docker_info_error        — stderr/error reason if daemon unreachable, else None
+    """
+    docker_path = _safe_run(client, "which docker").strip()
+    docker_binary_present = bool(docker_path)
+
+    # Daemon check: use docker --version first (no daemon needed) then info
+    # We already have docker_version from the main collection; here we check
+    # daemon reachability via docker info exit code.
+    daemon_reachable = False
+    docker_info_error: str | None = None
+    try:
+        rc, _, stderr = client.run("docker info --format json", timeout=15)
+        if rc == 0:
+            daemon_reachable = True
+        else:
+            docker_info_error = stderr.strip()[:300] if stderr else f"exit code {rc}"
+    except Exception as exc:
+        docker_info_error = str(exc)[:300]
+
+    # Compose v2 check: `docker compose version` succeeds only with the plugin
+    compose_v2 = False
+    try:
+        rc_c, _, _ = client.run("docker compose version", timeout=10)
+        compose_v2 = rc_c == 0
+    except Exception:
+        pass
+
+    return {
+        "docker_binary_present": docker_binary_present,
+        "docker_daemon_reachable": daemon_reachable,
+        "docker_compose_v2_available": compose_v2,
+        "docker_info_error": docker_info_error,
+    }
+
+
 def _collect_filesystem_hints(client: SSHClient, deploy_path: str) -> dict[str, Any]:
     hints: dict[str, Any] = {}
     for path in ["/opt", "/opt/apps", "/var/www", "/home/deploy", deploy_path]:
@@ -161,6 +203,7 @@ async def collect_inventory(
         service_info = _collect_service_info(client)
         containers = _collect_containers(client)
         filesystem_hints = _collect_filesystem_hints(client, target.deploy_path)
+        docker_binary_info = _collect_docker_binary_info(client)
 
         raw_docker_info = _safe_run(client, "docker info --format json", timeout=30)
         docker_info = parse_docker_info(raw_docker_info)
@@ -196,6 +239,7 @@ async def collect_inventory(
             project_id=target.project_id,
             host_info=host_info,
             docker_info=docker_info,
+            docker_binary_info=docker_binary_info,
             containers=containers,
             images=images,
             networks=networks,
@@ -288,6 +332,13 @@ def build_sanitized_inventory(snapshot: InventorySnapshot) -> dict[str, Any]:
         "docker": {
             "version": snapshot.docker_info.get("version"),
             "containers_running": snapshot.docker_info.get("containers_running"),
+            # These fields are set independently of the daemon so they are
+            # reliable even when docker_info is empty (daemon unreachable).
+            # An empty 'version' above does NOT mean Docker is absent.
+            "binary_present": snapshot.docker_binary_info.get("docker_binary_present", False),
+            "daemon_reachable": snapshot.docker_binary_info.get("docker_daemon_reachable", False),
+            "compose_v2_available": snapshot.docker_binary_info.get("docker_compose_v2_available", False),
+            "daemon_error": snapshot.docker_binary_info.get("docker_info_error"),
         },
         "containers": containers_safe,
         "networks": [{"name": n.get("name"), "driver": n.get("driver")} for n in snapshot.networks],

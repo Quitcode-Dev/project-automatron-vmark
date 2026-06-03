@@ -156,6 +156,11 @@ class InventorySnapshot(BaseModel):
     project_id: str
     host_info: dict[str, Any] = Field(default_factory=dict)
     docker_info: dict[str, Any] = Field(default_factory=dict)
+    # docker_binary_info captures Docker availability independently of the
+    # daemon. docker_info may be empty even when Docker is installed (daemon
+    # unreachable), so these fields distinguish "not installed" from "installed
+    # but daemon down" from "fully operational with compose v2".
+    docker_binary_info: dict[str, Any] = Field(default_factory=dict)
     containers: list[ContainerInfo] = Field(default_factory=list)
     images: list[dict[str, Any]] = Field(default_factory=list)
     networks: list[dict[str, Any]] = Field(default_factory=list)

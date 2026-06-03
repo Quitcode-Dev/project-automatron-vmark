@@ -1,11 +1,6 @@
 """Rollback metadata capture — MVP state.
 
-ROLLBACK EXECUTION IS DISABLED FOR MVP (Option B decision).
-
-Reason: UPLOAD_FILE and WRITE_ENV_FILE actions — required to restore the
-previous compose file to the remote server — are not yet implemented.
-Without file upload, `ROLLBACK_TO_PREVIOUS_RELEASE` would silently do nothing,
-creating false confidence that a rollback succeeded.
+ROLLBACK EXECUTION IS DISABLED.
 
 What IS implemented:
   - `capture_rollback_metadata()` — captures server state before each deploy
@@ -18,8 +13,8 @@ What is NOT implemented:
 
 The API route POST /deployment-runs/{run_id}/rollback returns HTTP 501.
 
-P1 task to implement: add UPLOAD_FILE / heredoc-based compose restore,
-then enable execute_rollback and set rollback_available=1 after capture.
+To implement: restore previous compose/env files via UPLOAD_FILE/WRITE_ENV_FILE,
+run docker compose up, run rollback healthcheck, then set rollback_available=1.
 """
 
 from __future__ import annotations
@@ -143,9 +138,9 @@ async def execute_rollback(
     return {
         "status": "not_implemented",
         "error": (
-            "Rollback execution is not available in this version. "
-            "UPLOAD_FILE and WRITE_ENV_FILE actions required for compose restore "
-            "are not yet implemented. "
+            "Rollback execution is not implemented yet. "
+            "Rollback metadata is captured, but previous compose/env restoration "
+            "and rollback healthcheck are disabled in this version. "
             "To rollback manually: ssh to the server, restore the previous "
             "docker-compose.yml, and run docker compose up -d."
         ),

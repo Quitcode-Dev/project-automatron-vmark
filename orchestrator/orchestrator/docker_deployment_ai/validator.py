@@ -245,6 +245,69 @@ def _check_unimplemented_executor_actions(plan: dict[str, Any]) -> list[Validati
     ]
 
 
+_COMPOSE_ACTION_TYPES: frozenset[str] = frozenset([
+    "DOCKER_COMPOSE_CONFIG",
+    "DOCKER_COMPOSE_PULL",
+    "DOCKER_COMPOSE_BUILD",
+    "DOCKER_COMPOSE_UP",
+    "DOCKER_COMPOSE_DOWN",
+    "DOCKER_COMPOSE_PS",
+])
+
+
+def _check_docker_compose_v2(
+    plan: dict[str, Any],
+    snapshot: InventorySnapshot,
+) -> ValidationCheck:
+    """Block compose-based plans when the target lacks Docker Compose v2.
+
+    This check fires only when the plan actually contains compose actions.
+    If the snapshot has no docker_binary_info (e.g. from an older inventory
+    that predates this field), the check passes with a warning.
+    """
+    actions = plan.get("deployment_actions") or []
+    uses_compose = any(
+        (action.get("action_type") or "").upper() in _COMPOSE_ACTION_TYPES
+        for action in actions
+    )
+    if not uses_compose:
+        return ValidationCheck(
+            "docker_compose_v2_check", True,
+            "Plan does not use Docker Compose actions — no v2 check needed",
+        )
+
+    info = snapshot.docker_binary_info
+    if not info:
+        # Old snapshot pre-dates this field — pass non-blocking to avoid
+        # blocking plans validated before this feature was added.
+        return ValidationCheck(
+            "docker_compose_v2_check", True,
+            "Docker Compose v2 availability unknown (inventory pre-dates check) — proceeding",
+            blocking=False,
+        )
+
+    if not info.get("docker_binary_present", False):
+        return ValidationCheck(
+            "docker_compose_v2_check", False,
+            "Docker binary not found on the target host. "
+            "Install Docker Engine before deploying.",
+        )
+
+    if not info.get("docker_compose_v2_available", False):
+        return ValidationCheck(
+            "docker_compose_v2_check", False,
+            "Docker Compose v2 plugin is not available on the target host "
+            "(`docker compose version` failed). "
+            "Install the Docker Compose v2 plugin: "
+            "https://docs.docker.com/compose/install/",
+        )
+
+    return ValidationCheck(
+        "docker_compose_v2_check", True,
+        "Docker Compose v2 is available on the target host",
+    )
+
+
 def _check_policy(
     plan: dict[str, Any],
     detection: dict[str, Any],
@@ -273,6 +336,9 @@ def validate_deployment_plan(
 
     # 2b. Executor capability gate — blocks known-unimplemented actions early
     all_checks.extend(_check_unimplemented_executor_actions(plan))
+
+    # 2c. Docker Compose v2 prerequisite — blocks compose plans on v1-only hosts
+    all_checks.append(_check_docker_compose_v2(plan, snapshot))
 
     # 3. Rollback
     all_checks.append(_check_rollback(plan))

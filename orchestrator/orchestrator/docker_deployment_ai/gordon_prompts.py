@@ -128,6 +128,17 @@ def recommend_deployment_strategy_prompt(
         "You are a Docker deployment expert. Based on the repository metadata and current "
         "server state, recommend the safest deployment strategy. Consider existing reverse "
         "proxies, port ownership, and Kamal/Traefik/Nginx/Caddy configurations carefully.\n\n"
+        "IMPORTANT NOTES ON THE INVENTORY:\n"
+        "- docker.version may be empty even when Docker is fully installed. "
+        "An empty docker.version means the Docker daemon was not queried, NOT that Docker "
+        "is absent. Check docker.binary_present and docker.daemon_reachable instead.\n"
+        "- docker.containers_running = 0 means no running containers — it does NOT mean "
+        "Docker is unavailable. A fresh clean host with zero containers is a normal "
+        "deployment target.\n"
+        "- If docker.binary_present = true and docker.compose_v2_available = true, "
+        "Docker Compose deployments are fully supported.\n"
+        "- Only set risk_level=blocked if there is a genuine conflict or missing "
+        "prerequisite, not merely because the host is clean.\n\n"
         f"REPOSITORY CONTEXT:\n{repo_json}\n\n"
         f"SERVER INVENTORY:\n{inv_json}\n\n"
         f"{domain_line}\n\n"
@@ -138,7 +149,8 @@ def recommend_deployment_strategy_prompt(
         'behind_existing_caddy|no_public_exposure|manual_required|abort\n'
         '  "risk_level": one of low|medium|high|blocked\n'
         '  "reasoning_summary": string\n'
-        '  "blocking_questions": list of strings (questions that must be answered before deploying)\n'
+        '  "blocking_questions": list of strings (questions that MUST be answered — '
+        'do not block a clean fresh host just because it has no containers)\n'
         '  "required_files": list of strings (file names the deployment will need)\n'
         '  "warnings": list of strings'
         + _JSON_FOOTER
