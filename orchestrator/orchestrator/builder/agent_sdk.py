@@ -366,7 +366,15 @@ Workflow:
 the spec doesn't mention.
 4. Call run_build to verify your changes compile.
 5. If the build fails, read the error, fix it, and run_build again. Limit to 3 fix attempts.
-6. Call done with a 1-3 sentence summary once the build passes.
+6. Call the `done` tool with a 1-3 sentence summary once the build passes.
+
+CRITICAL — HOW TO FINISH:
+- You MUST call the `done` tool to complete your work. A text-only message at the end is NOT \
+completion. If you stop your turn without calling `done`, your changes may be discarded. \
+"The build passes and I'm finished" written as text is not enough — that exact thought must \
+be passed as the `summary` parameter to the `done` tool.
+- Every turn must end with EITHER a tool call (any tool, including `done`) OR you must \
+continue working with more tool calls. Never reply with text alone.
 
 Hard rules:
 - NEVER write a file whose name contains '=', whitespace, or starts with a shell command \
@@ -508,9 +516,24 @@ async def implement_issue_via_agent_sdk(
         usage.merge_response(response.usage)
 
         if response.stop_reason == "end_turn":
-            # Model finished without calling done — treat as incomplete
+            # The model stopped talking without calling `done`. Two cases:
+            #   1. It made real changes (write/edit/delete) and just summarised
+            #      in text instead of using the `done` tool — protocol slip, but
+            #      the actual work succeeded. Promote the text to a done summary
+            #      and fall through to commit + push.
+            #   2. It made zero changes — pure exploration / chat. That's a real
+            #      failure; surface it.
             text_blocks = [b.text for b in response.content if getattr(b, "type", None) == "text"]
-            return None, f"agent ended without calling done: {' '.join(text_blocks)[:500]}", usage
+            final_text = " ".join(text_blocks).strip()
+            if write_tool_calls > 0:
+                logger.warning(
+                    "Agent SDK: end_turn without `done` call but %d write op(s) occurred — "
+                    "promoting text to done summary for issue #%d",
+                    write_tool_calls, issue_number,
+                )
+                done_summary = final_text[:800] if final_text else "(no summary — text was empty)"
+                break
+            return None, f"agent ended without calling done and made no changes: {final_text[:500]}", usage
 
         # Append assistant turn
         messages.append({"role": "assistant", "content": [b.model_dump() for b in response.content]})
