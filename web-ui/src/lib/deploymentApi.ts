@@ -117,6 +117,19 @@ export interface DeploymentRun {
   rollback_available: number;
 }
 
+export interface RunStep {
+  id?: string;
+  run_id?: string;
+  step_index?: number;
+  action_type: string;
+  status: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  stdout_excerpt?: string | null;
+  stderr_excerpt?: string | null;
+  error_message?: string | null;
+}
+
 // ---- Target API ----
 
 export function createDeploymentTarget(
@@ -168,7 +181,7 @@ export function listDockerAIAnalyses(targetId: string): Promise<DockerAIAnalysis
 export function createDeploymentPlan(
   projectId: string,
   data: { target_id: string; desired_domain?: string; preferred_strategy?: string }
-): Promise<{ status: string }> {
+): Promise<{ status: string; plan_id: string; target_id: string }> {
   return request(`/projects/${projectId}/deployment-plans`, {
     method: "POST",
     body: JSON.stringify(data),
@@ -193,7 +206,7 @@ export function approveDeploymentPlan(
   });
 }
 
-export function executeDeploymentPlan(planId: string): Promise<{ status: string }> {
+export function executeDeploymentPlan(planId: string): Promise<{ run_id: string; status: string }> {
   return request(`/deployment-plans/${planId}/execute`, { method: "POST" });
 }
 
@@ -203,9 +216,7 @@ export function getDeploymentRun(runId: string): Promise<DeploymentRun> {
   return request(`/deployment-runs/${runId}`);
 }
 
-export function getDeploymentRunSteps(
-  runId: string
-): Promise<Array<Record<string, unknown>>> {
+export function getDeploymentRunSteps(runId: string): Promise<RunStep[]> {
   return request(`/deployment-runs/${runId}/steps`);
 }
 

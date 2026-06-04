@@ -74,7 +74,15 @@
       "Bash(curl -s http://localhost:18001/api/deployment-runs/0430ef19-7c83-4b35-9a5d-0a6b8153debd)",
       "Bash(curl -s -X POST http://localhost:18001/api/deployment-plans/f9c16dfd-228c-4467-b9f7-1ccf9f63f829/approve -H 'Content-Type: application/json' -d '{\"approval_note\":\"E2E test\"}')",
       "Bash(.venv/Scripts/python.exe -m pytest tests/test_docker_deployment_ai.py tests/test_docker_deployment_ai_security.py tests/test_docker_deployment_ai_api.py tests/test_docker_deployment_ai_staging.py -q --tb=short)",
-      "Bash(ssh -i /tmp/staging_test_key -o StrictHostKeyChecking=no -o BatchMode=yes -p 2222 deploy@localhost 'cd /opt/deploy/testapp && docker compose down 2>&1 | tail -2; docker ps')"
+      "Bash(ssh -i /tmp/staging_test_key -o StrictHostKeyChecking=no -o BatchMode=yes -p 2222 deploy@localhost 'cd /opt/deploy/testapp && docker compose down 2>&1 | tail -2; docker ps')",
+      "Bash(grep \"\\\\.py$\")",
+      "Bash(rtk find *)",
+      "Bash(npm test *)",
+      "Bash(rtk npm *)",
+      "Bash(rtk tsc *)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(d['version']\\)\")",
+      "Bash(curl -s -b \"automatron_dev_bypass=true\" http://localhost/api/projects)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d[:1], indent=2\\)\\) if isinstance\\(d,list\\) else print\\(d\\)\")"
     ],
     "additionalDirectories": [
       "\\tmp"

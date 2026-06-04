@@ -955,7 +955,7 @@ export default function ProjectPage() {
 
         {activeTab === "deploy" && (
           <div className="h-full overflow-auto">
-            {project && <DeploymentPanel projectId={project.id} />}
+            {currentProject && <DeploymentPanel projectId={currentProject.id} />}
           </div>
         )}
         {false && (

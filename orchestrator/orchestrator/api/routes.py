@@ -828,6 +828,9 @@ async def api_create_deployment_plan(
     session: dict = Depends(_require_auth),
 ) -> dict[str, Any]:
     await _get_required_project(project_id)
+    # Generate plan_id before the background task so the caller can poll it immediately.
+    import uuid as _uuid  # noqa: PLC0415
+    plan_id = str(_uuid.uuid4())
 
     async def _run() -> None:
         db = await _get_deployment_db()
@@ -840,12 +843,42 @@ async def api_create_deployment_plan(
                 preferred_strategy=req.preferred_strategy,
                 created_by=session.get("email"),
                 db=db,
+                plan_id=plan_id,
             )
         finally:
             await db.close()
 
     background_tasks.add_task(_run)
-    return {"status": "started", "project_id": project_id}
+    return {"status": "started", "project_id": project_id, "plan_id": plan_id, "target_id": req.target_id}
+
+
+@router.get("/deployment-targets/{target_id}/deployment-plans/latest")
+async def api_get_latest_deployment_plan(
+    target_id: str,
+    _session: dict = Depends(_require_auth),
+) -> dict[str, Any]:
+    """Return the most recently created plan for a target. Used for polling after plan creation."""
+    db = await _get_deployment_db()
+    try:
+        await _require_target_access(target_id, db)
+        db.row_factory = _aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM deployment_plans WHERE target_id = ? ORDER BY created_at DESC LIMIT 1",
+            (target_id,),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="No deployment plans found for this target")
+        import json as _json  # noqa: PLC0415
+        data = dict(row)
+        try:
+            data["plan_json"] = _json.loads(data.get("plan_json") or "{}")
+            data["blocking_questions_json"] = _json.loads(data.get("blocking_questions_json") or "[]")
+        except _json.JSONDecodeError:
+            pass
+        return data
+    finally:
+        await db.close()
 
 
 @router.get("/deployment-plans/{plan_id}")

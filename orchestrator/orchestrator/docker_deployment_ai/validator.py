@@ -135,6 +135,11 @@ def _check_rollback(plan: dict[str, Any]) -> ValidationCheck:
     return ValidationCheck("rollback_plan_present", True, "Rollback plan is defined")
 
 
+_PROXY_OWNS_80_443: frozenset[str] = frozenset(["traefik", "kamal_proxy", "nginx", "caddy"])
+_HOST_BIND_STRATEGIES: frozenset[str] = frozenset(["docker_compose_with_host_port"])
+_TRAEFIK_STRATEGIES: frozenset[str] = frozenset(["reuse_existing_traefik"])
+
+
 def _check_routing(
     plan: dict[str, Any],
     snapshot: InventorySnapshot,
@@ -147,7 +152,7 @@ def _check_routing(
     rp = server_state.get("reverse_proxy", "unknown")
     dm = server_state.get("deployment_manager", "unknown")
 
-    # Host port conflict check
+    # Host port conflict: plan requests a port that is already listening on the host.
     host_port = port_plan.get("host_port")
     if host_port:
         occupied = any(p.port == host_port for p in snapshot.listening_ports)
@@ -164,37 +169,236 @@ def _check_routing(
                 f"host_port_{host_port}_free", True, f"Host port {host_port} is free"
             ))
 
-    # Domain conflict check
+    # Domain conflict: check Traefik Host() router rules across all container labels.
     domain = routing_plan.get("domain")
     if domain:
         for c in snapshot.containers:
             for k, v in c.labels.items():
-                if "rule" in k.lower() and domain in v:
+                # Match traefik.http.routers.*.rule labels containing Host(`domain`)
+                if "rule" in k.lower() and f"host(`{domain}`)" in v.lower():
                     checks.append(ValidationCheck(
                         "domain_not_already_routed", False,
-                        f"Domain '{domain}' is already routed to container '{c.name}' via label '{k}'."
+                        f"Domain '{domain}' already exists in Traefik Host() rule "
+                        f"on container '{c.name}' (label: {k})."
+                    ))
+                    break
+                # Fallback: older label format without Host() syntax
+                elif "rule" in k.lower() and domain in v and "host(" not in v.lower():
+                    checks.append(ValidationCheck(
+                        "domain_not_already_routed", False,
+                        f"Domain '{domain}' is already routed to container '{c.name}' "
+                        f"via label '{k}'."
                     ))
                     break
 
-    # Second proxy installation check
-    proxy_install_strategies = {"reuse_existing_traefik"}
-    if strategy not in proxy_install_strategies and rp in ("nginx", "caddy", "kamal_proxy"):
-        if strategy in ("docker_compose_with_host_port",) and rp in ("nginx", "caddy"):
-            checks.append(ValidationCheck(
-                "no_port_conflict_with_proxy", False,
-                f"'{rp}' proxy owns ports 80/443. "
-                "Host-port strategy conflicts with existing proxy."
-            ))
+    # Published Docker port conflict: check if any container already publishes
+    # the same host port the plan requests.
+    if host_port:
+        for c in snapshot.containers:
+            for port_entry in c.ports:
+                existing_host_port = port_entry.get("host_port") or port_entry.get("HostPort")
+                if existing_host_port and int(existing_host_port) == int(host_port):
+                    checks.append(ValidationCheck(
+                        f"docker_published_port_{host_port}_free", False,
+                        f"Docker port {host_port} is already published by container '{c.name}'."
+                    ))
+                    break
 
-    # Kamal v2 + Traefik conflict
-    if dm == DeploymentManager.kamal_v2.value and strategy == "reuse_existing_traefik":
+    # Direct bind to 80/443 when a proxy already owns those ports.
+    # Strategies that try to bind a host port will conflict with proxy ownership.
+    _PORT_80_443 = {80, 443}
+    plan_binds_privileged_port = (
+        strategy in _HOST_BIND_STRATEGIES
+        and host_port is not None
+        and int(host_port) in _PORT_80_443
+    )
+    proxy_owns_ports = rp in _PROXY_OWNS_80_443
+    if plan_binds_privileged_port and proxy_owns_ports:
+        checks.append(ValidationCheck(
+            "no_direct_bind_80_443_with_proxy", False,
+            f"'{rp}' owns ports 80/443. Plan cannot bind directly to port {host_port}. "
+            "Use a strategy compatible with the existing proxy instead."
+        ))
+    elif proxy_owns_ports and strategy in _HOST_BIND_STRATEGIES:
+        # Any host-port strategy conflicts when a proxy owns the routing layer,
+        # even if the specific port is not 80/443.
+        checks.append(ValidationCheck(
+            "no_port_conflict_with_proxy", False,
+            f"'{rp}' proxy owns ports 80/443. "
+            "Host-port strategy conflicts with the existing proxy."
+        ))
+
+    # Kamal v2 / kamal-proxy + Traefik strategy conflict.
+    if rp == ReverseProxy.kamal_proxy.value and strategy in _TRAEFIK_STRATEGIES:
         checks.append(ValidationCheck(
             "no_traefik_over_kamal_proxy", False,
-            "Cannot use Traefik strategy when kamal-proxy is the active proxy (Kamal v2)."
+            "Cannot use Traefik strategy when kamal-proxy is the active proxy (Kamal v2). "
+            "Use 'kamal_v2_compatible' or 'manual_required' instead."
+        ))
+
+    # Kamal v2 deployment manager + Traefik strategy (redundant defence).
+    if dm == DeploymentManager.kamal_v2.value and strategy in _TRAEFIK_STRATEGIES:
+        checks.append(ValidationCheck(
+            "no_traefik_strategy_on_kamal_v2", False,
+            "Cannot use Traefik strategy when Kamal v2 manages this host."
+        ))
+
+    # Mixed routing ownership → deployment cannot proceed automatically.
+    if dm == DeploymentManager.mixed.value and strategy not in ("manual_required", "abort"):
+        checks.append(ValidationCheck(
+            "mixed_routing_blocks_deploy", False,
+            "Multiple conflicting reverse proxies detected (mixed setup). "
+            "Strategy must be 'manual_required' or 'abort' until routing ownership is clarified."
+        ))
+
+    # Unknown reverse proxy owns 80/443 → cannot deploy safely.
+    port_80_listening = any(p.port in (80, 443) for p in snapshot.listening_ports)
+    if rp == ReverseProxy.unknown.value and port_80_listening and strategy not in ("manual_required", "abort"):
+        checks.append(ValidationCheck(
+            "unknown_owner_80_443_blocks_deploy", False,
+            "An unknown process owns port 80 or 443. "
+            "Routing ownership must be established before deploying. "
+            "Use 'manual_required' or identify the process first."
         ))
 
     if not any(not c.passed for c in checks):
         checks.append(ValidationCheck("routing_checks_passed", True, "No routing conflicts detected"))
+    return checks
+
+
+_AUTOMATRON_LABEL = "automatron.owned"
+
+
+def _check_docker_safety(
+    plan: dict[str, Any],
+    snapshot: InventorySnapshot,
+) -> list[ValidationCheck]:
+    """Block plans that would silently overwrite existing Docker resources.
+
+    Checks container, network, and volume name conflicts against the live
+    inventory. Resources tagged with Automatron ownership metadata are treated
+    as managed and may proceed (with a warning); unowned resources are blocked.
+    """
+    checks: list[ValidationCheck] = []
+    actions = plan.get("deployment_actions") or []
+
+    existing_container_names = {c.name for c in snapshot.containers}
+    existing_network_names = {
+        (n.get("Name") or n.get("name") or "") for n in snapshot.networks
+    }
+    existing_volume_names = {
+        (v.get("Name") or v.get("name") or "") for v in snapshot.volumes
+    }
+
+    def _network_is_owned(name: str) -> bool:
+        for n in snapshot.networks:
+            n_name = n.get("Name") or n.get("name") or ""
+            if n_name == name:
+                labels = n.get("Labels") or n.get("labels") or {}
+                if isinstance(labels, str):
+                    return _AUTOMATRON_LABEL in labels
+                return bool(labels.get(_AUTOMATRON_LABEL))
+        return False
+
+    def _volume_is_owned(name: str) -> bool:
+        for v in snapshot.volumes:
+            v_name = v.get("Name") or v.get("name") or ""
+            if v_name == name:
+                labels = v.get("Labels") or v.get("labels") or {}
+                if isinstance(labels, str):
+                    return _AUTOMATRON_LABEL in labels
+                return bool(labels.get(_AUTOMATRON_LABEL))
+        return False
+
+    network_found = False
+    volume_found = False
+
+    for action in actions:
+        atype = (action.get("action_type") or "").upper()
+        params = action.get("params") or {}
+
+        if atype == "DOCKER_NETWORK_CREATE":
+            network_name = params.get("network_name") or params.get("name") or ""
+            if network_name and network_name in existing_network_names:
+                network_found = True
+                if _network_is_owned(network_name):
+                    checks.append(ValidationCheck(
+                        f"network_owned_exists:{network_name}", True,
+                        f"Network '{network_name}' already exists and is Automatron-managed — "
+                        "will reuse.",
+                        blocking=False,
+                    ))
+                else:
+                    checks.append(ValidationCheck(
+                        f"network_conflict:{network_name}", False,
+                        f"Docker network '{network_name}' already exists without Automatron "
+                        "ownership metadata. Cannot overwrite an unmanaged network."
+                    ))
+
+        elif atype == "DOCKER_VOLUME_CREATE":
+            volume_name = params.get("volume_name") or params.get("name") or ""
+            if volume_name and volume_name in existing_volume_names:
+                volume_found = True
+                if _volume_is_owned(volume_name):
+                    checks.append(ValidationCheck(
+                        f"volume_owned_exists:{volume_name}", True,
+                        f"Volume '{volume_name}' already exists and is Automatron-managed — "
+                        "will reuse.",
+                        blocking=False,
+                    ))
+                else:
+                    checks.append(ValidationCheck(
+                        f"volume_conflict:{volume_name}", False,
+                        f"Docker volume '{volume_name}' already exists without Automatron "
+                        "ownership metadata. Cannot silently overwrite an unmanaged volume."
+                    ))
+
+        elif atype in ("DOCKER_COMPOSE_UP", "DOCKER_COMPOSE_DOWN", "DOCKER_COMPOSE_CONFIG"):
+            # Check for compose project name conflict with existing containers.
+            project_name = (
+                params.get("project_name")
+                or params.get("compose_project")
+                or plan.get("compose_project_name")
+                or ""
+            )
+            if project_name:
+                # Existing containers whose name starts with the project name
+                # indicate a compose project is already running under that name.
+                conflict_containers = [
+                    c.name for c in snapshot.containers
+                    if c.name.startswith(f"{project_name}_")
+                    or c.name.startswith(f"{project_name}-")
+                ]
+                if conflict_containers:
+                    # If ANY existing container carries Automatron ownership, allow it.
+                    owned = any(
+                        snapshot.containers[i].labels.get(_AUTOMATRON_LABEL)
+                        for i, c in enumerate(snapshot.containers)
+                        if c.name in conflict_containers
+                    )
+                    if not owned:
+                        checks.append(ValidationCheck(
+                            f"compose_project_conflict:{project_name}", False,
+                            f"Compose project '{project_name}' conflicts with existing "
+                            f"containers: {conflict_containers[:3]}. "
+                            "This would overwrite a running stack not managed by Automatron."
+                        ))
+
+    # Direct container name conflicts from resource_names in plan.
+    resource_names = plan.get("resource_names") or {}
+    container_name = resource_names.get("container_name") or ""
+    if container_name and container_name in existing_container_names:
+        checks.append(ValidationCheck(
+            f"container_name_conflict:{container_name}", False,
+            f"Container '{container_name}' already exists. "
+            "Cannot deploy with a conflicting container name."
+        ))
+
+    if not any(not c.passed for c in checks):
+        checks.append(ValidationCheck(
+            "docker_safety_checks_passed", True,
+            "No container/network/volume name conflicts detected"
+        ))
     return checks
 
 
@@ -345,6 +549,9 @@ def validate_deployment_plan(
 
     # 4. Routing
     all_checks.extend(_check_routing(plan, snapshot))
+
+    # 4b. Docker resource safety (container/network/volume name conflicts)
+    all_checks.extend(_check_docker_safety(plan, snapshot))
 
     # 5. Secrets
     all_checks.append(_check_secrets(plan))

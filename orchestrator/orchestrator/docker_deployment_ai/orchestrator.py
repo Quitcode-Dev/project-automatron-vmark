@@ -210,6 +210,7 @@ class DockerDeploymentOrchestrator:
         preferred_strategy: str,
         created_by: str | None,
         db: aiosqlite.Connection,
+        plan_id: str | None = None,
     ) -> dict[str, Any]:
         target = await get_target(db, target_id)
         if not target:
@@ -225,7 +226,7 @@ class DockerDeploymentOrchestrator:
             raw_json = snapshot_data.get("raw_json") or {}
             snapshot = InventorySnapshot.model_validate(raw_json)
 
-            plan_id, plan = await create_deployment_plan(
+            returned_plan_id, plan = await create_deployment_plan(
                 project_id=project_id,
                 target_id=target_id,
                 snapshot=snapshot,
@@ -236,7 +237,9 @@ class DockerDeploymentOrchestrator:
                 deploy_path=target.deploy_path,
                 created_by=created_by,
                 db=db,
+                plan_id=plan_id,
             )
+            plan_id = returned_plan_id
             if plan.get("risk_level") == "blocked":
                 await emit_plan_blocked(project_id, plan_id, plan.get("blocking_questions") or [])
             else:
@@ -489,6 +492,31 @@ class DockerDeploymentOrchestrator:
             return {"status": "rejected",
                     "error": "Plan has risk_level=blocked and cannot be executed.",
                     "http_status": 409}
+
+        # Single-flight guard: one active deployment per target at a time.
+        # Active = any run that is mutating the target (pending/starting/running/deploying).
+        # Completed, failed, and cancelled runs do not block new deployments.
+        cursor = await db.execute(
+            """
+            SELECT id, status FROM deploy_runs
+            WHERE target_id = ?
+              AND status IN ('pending', 'starting', 'running', 'deploying')
+            ORDER BY started_at DESC LIMIT 1
+            """,
+            (target_id,),
+        )
+        active_row = await cursor.fetchone()
+        if active_row:
+            active_id, active_status = active_row
+            return {
+                "status": "rejected",
+                "error": (
+                    f"Target '{target_id}' already has an active deployment run "
+                    f"'{active_id}' (status: '{active_status}'). "
+                    "Wait for it to complete before starting a new deployment."
+                ),
+                "http_status": 409,
+            }
 
         # Create run row — committed before this method returns so the run_id
         # is readable by any concurrent GET before execution starts.

@@ -1,16 +1,13 @@
 "use client";
 
 /**
- * DeploymentPanel — the main Docker Deployment Intelligence UI.
+ * DeploymentPanel — orchestrates the full Docker Deployment Intelligence flow.
  *
- * Replaces the legacy VPS-target form in the project page's "deploy" tab.
- * Shows all 14-section deployment flow per the spec §25:
- *   1. Targets  2. Inventory  3. Server state  4. Reverse proxy detection
- *   5. Docker AI analysis  6. Routing conflicts  7. Plan  8. Validation
- *   9. Secrets  10. Approval  11. Live log  12. Health  13. Rollback
+ * Sub-components handle display; this component owns data fetching, polling,
+ * WebSocket event subscriptions, and state wiring.
  */
 
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   approveDeploymentPlan,
   createDeploymentPlan,
@@ -21,6 +18,7 @@ import {
   executeDeploymentPlan,
   getDeploymentPlan,
   getDeploymentRun,
+  getDeploymentRunSteps,
   getLatestInventory,
   InventorySnapshot,
   listDeploymentTargets,
@@ -28,26 +26,16 @@ import {
   rollbackDeploymentRun,
   runDockerAIAnalysis,
   runInventory,
+  RunStep,
   validateDeploymentPlan,
   ValidationResult,
 } from "@/lib/deploymentApi";
+import { PlanDetail } from "./PlanDetail";
+import { ApprovalGates } from "./ApprovalGates";
+import { RunView } from "./RunView";
+import { getSocket } from "@/lib/socket";
 
-// ---- Risk level badge ----
-const RISK_COLORS: Record<string, string> = {
-  low: "bg-green-100 text-green-800",
-  medium: "bg-yellow-100 text-yellow-800",
-  high: "bg-orange-100 text-orange-800",
-  blocked: "bg-red-100 text-red-800",
-};
-
-function RiskBadge({ risk }: { risk: string }) {
-  return (
-    <span className={`rounded px-2 py-0.5 text-xs font-semibold ${RISK_COLORS[risk] ?? "bg-muted text-muted-foreground"}`}>
-      {risk.toUpperCase()}
-    </span>
-  );
-}
-
+// ---- Provider badge (inventory / analysis section) ----
 function ProviderBadge({ provider }: { provider: string | undefined }) {
   const label =
     provider === "gordon" ? "Gordon (docker ai)"
@@ -65,7 +53,7 @@ function ProviderBadge({ provider }: { provider: string | undefined }) {
   );
 }
 
-// ---- Target form ----
+// ---- Target registration form ----
 function TargetForm({
   projectId,
   onCreated,
@@ -109,7 +97,12 @@ function TargetForm({
       <input
         type={type}
         value={String(form[key])}
-        onChange={(e) => setForm((f) => ({ ...f, [key]: type === "number" ? Number(e.target.value) : e.target.value }))}
+        onChange={(e) =>
+          setForm((f) => ({
+            ...f,
+            [key]: type === "number" ? Number(e.target.value) : e.target.value,
+          }))
+        }
         className="rounded border border-input bg-background px-2 py-1.5 text-sm"
       />
     </label>
@@ -136,7 +129,9 @@ function TargetForm({
             onChange={(e) => setForm((f) => ({ ...f, environment: e.target.value }))}
             className="rounded border border-input bg-background px-2 py-1.5 text-sm"
           >
-            {["preview", "staging", "production"].map((v) => <option key={v} value={v}>{v}</option>)}
+            {["preview", "staging", "production"].map((v) => (
+              <option key={v} value={v}>{v}</option>
+            ))}
           </select>
         </label>
         <label className="flex flex-col gap-1 text-xs">
@@ -146,9 +141,11 @@ function TargetForm({
             onChange={(e) => setForm((f) => ({ ...f, preferred_strategy: e.target.value }))}
             className="rounded border border-input bg-background px-2 py-1.5 text-sm"
           >
-            {["auto_detect","docker_compose_private","docker_compose_with_host_port",
-              "existing_traefik","kamal_v1","kamal_v2","existing_nginx","existing_caddy",
-              "no_public_exposure"].map((v) => <option key={v} value={v}>{v}</option>)}
+            {[
+              "auto_detect", "docker_compose_private", "docker_compose_with_host_port",
+              "existing_traefik", "kamal_v1", "kamal_v2", "existing_nginx",
+              "existing_caddy", "no_public_exposure",
+            ].map((v) => <option key={v} value={v}>{v}</option>)}
           </select>
         </label>
       </div>
@@ -164,20 +161,72 @@ function TargetForm({
   );
 }
 
+// ---- Polling hook ----
+const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "error"]);
+
+function useRunPoller(
+  runId: string | null,
+  onUpdate: (run: DeploymentRun, steps: RunStep[]) => void,
+) {
+  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    if (!runId) return;
+    const poll = async () => {
+      try {
+        const [run, steps] = await Promise.all([
+          getDeploymentRun(runId),
+          getDeploymentRunSteps(runId),
+        ]);
+        onUpdate(run, steps);
+        if (TERMINAL_STATUSES.has(run.status)) {
+          if (timer.current) clearInterval(timer.current);
+          timer.current = null;
+        }
+      } catch {
+        // network errors during polling are non-fatal
+      }
+    };
+    void poll(); // immediate first poll
+    timer.current = setInterval(() => void poll(), 3000);
+    return () => {
+      if (timer.current) clearInterval(timer.current);
+    };
+  }, [runId, onUpdate]);
+}
+
 // ---- Main panel ----
 export default function DeploymentPanel({ projectId }: { projectId: string }) {
   const [targets, setTargets] = useState<DeploymentTarget[]>([]);
   const [selectedTarget, setSelectedTarget] = useState<DeploymentTarget | null>(null);
   const [snapshot, setSnapshot] = useState<InventorySnapshot | null>(null);
-  const [analyses, setAnalyses] = useState<ReturnType<typeof listDockerAIAnalyses> extends Promise<infer T> ? T : never>([]);
+  const [analyses, setAnalyses] = useState<Awaited<ReturnType<typeof listDockerAIAnalyses>>>([]);
   const [plan, setPlan] = useState<DeploymentPlan | null>(null);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
+  const [approved, setApproved] = useState(false);
+  const [rollbackAck, setRollbackAck] = useState(false);
   const [run, setRun] = useState<DeploymentRun | null>(null);
+  const [runSteps, setRunSteps] = useState<RunStep[]>([]);
+  const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [hasActiveRun, setHasActiveRun] = useState(false);
   const [showTargetForm, setShowTargetForm] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
+  // Reset plan/validation/approval when target changes
+  useEffect(() => {
+    setPlan(null);
+    setValidation(null);
+    setApproved(false);
+    setRollbackAck(false);
+    setRun(null);
+    setRunSteps([]);
+    setActiveRunId(null);
+    setHasActiveRun(false);
+  }, [selectedTarget?.id]);
+
+  // Load targets on mount
+  const loadTargets = useCallback(async () => {
     const ts = await listDeploymentTargets(projectId).catch(() => []);
     setTargets(ts);
     if (ts.length > 0 && !selectedTarget) {
@@ -185,8 +234,11 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
     }
   }, [projectId, selectedTarget]);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    void loadTargets();
+  }, [loadTargets]);
 
+  // Load inventory and analyses when target changes
   useEffect(() => {
     if (!selectedTarget) return;
     void getLatestInventory(selectedTarget.id)
@@ -197,12 +249,47 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
       .catch(() => setAnalyses([]));
   }, [selectedTarget]);
 
+  // WebSocket: listen for deployment events on this project
+  useEffect(() => {
+    const socket = getSocket();
+    if (!socket) return;
+
+    const onRunCompleted = (data: { run_id?: string }) => {
+      if (data.run_id && data.run_id === activeRunId) {
+        void getDeploymentRun(data.run_id).then((r) => setRun(r)).catch(() => {});
+        void getDeploymentRunSteps(data.run_id).then(setRunSteps).catch(() => {});
+      }
+    };
+    const onStepCompleted = (data: { run_id?: string }) => {
+      if (data.run_id && data.run_id === activeRunId) {
+        void getDeploymentRunSteps(data.run_id).then(setRunSteps).catch(() => {});
+      }
+    };
+
+    socket.on("deployment.run.completed", onRunCompleted);
+    socket.on("deployment.run.step_completed", onStepCompleted);
+    return () => {
+      socket.off("deployment.run.completed", onRunCompleted);
+      socket.off("deployment.run.step_completed", onStepCompleted);
+    };
+  }, [activeRunId]);
+
+  // Polling fallback: update run + steps every 3s until terminal
+  const handleRunUpdate = useCallback((updatedRun: DeploymentRun, steps: RunStep[]) => {
+    setRun(updatedRun);
+    setRunSteps(steps);
+    if (TERMINAL_STATUSES.has(updatedRun.status)) {
+      setHasActiveRun(false);
+    }
+  }, []);
+
+  useRunPoller(activeRunId, handleRunUpdate);
+
   const action = async (label: string, fn: () => Promise<void>) => {
     setBusy(label);
     setMsg(null);
     try {
       await fn();
-      setMsg(`${label} started`);
     } catch (err) {
       setMsg(err instanceof Error ? err.message : String(err));
     } finally {
@@ -210,9 +297,30 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
     }
   };
 
-  const planJson = plan?.plan_json as Record<string, unknown> | undefined;
-  const dockerAi = planJson?.docker_ai as Record<string, unknown> | undefined;
-  const serverState = planJson?.detected_server_state as Record<string, unknown> | undefined;
+  const handleRunStarted = useCallback((runId: string) => {
+    setActiveRunId(runId);
+    setHasActiveRun(true);
+    setMsg(`Deployment started — tracking run ${runId}`);
+  }, []);
+
+  const handleApprove = useCallback(async () => {
+    if (!plan) return;
+    await approveDeploymentPlan(plan.id);
+    setApproved(true);
+    setMsg("Plan approved");
+  }, [plan]);
+
+  const handleExecute = useCallback(async () => {
+    if (!plan) throw new Error("No plan selected");
+    return executeDeploymentPlan(plan.id);
+  }, [plan]);
+
+  const handleRollback = useCallback(async () => {
+    if (!run) return;
+    await action("Rollback", async () => {
+      await rollbackDeploymentRun(run.id);
+    });
+  }, [run]);
 
   return (
     <div className="flex h-full flex-col gap-4 overflow-auto p-1 text-sm">
@@ -240,7 +348,9 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
           </div>
         )}
         {targets.length === 0 && !showTargetForm && (
-          <p className="mt-2 text-xs text-muted-foreground">No targets yet. Register one to get started.</p>
+          <p className="mt-2 text-xs text-muted-foreground">
+            No targets yet. Register one to get started.
+          </p>
         )}
         <div className="mt-2 flex flex-wrap gap-2">
           {targets.map((t) => (
@@ -339,7 +449,9 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
                 ))}
               </div>
             ) : (
-              <p className="mt-2 text-xs text-muted-foreground">No analyses yet. Run inventory first.</p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                No analyses yet. Run inventory first.
+              </p>
             )}
           </section>
 
@@ -355,7 +467,14 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
                         target_id: selectedTarget.id,
                         preferred_strategy: selectedTarget.preferred_strategy,
                       });
-                      await new Promise((res) => setTimeout(res, 3000));
+                      if (r.plan_id) {
+                        // Poll until the background task writes the plan
+                        await new Promise((res) => setTimeout(res, 3000));
+                        const fetched = await getDeploymentPlan(r.plan_id);
+                        setPlan(fetched);
+                        setValidation(null);
+                        setApproved(false);
+                      }
                     })
                   }
                   disabled={busy !== null || !snapshot}
@@ -363,48 +482,7 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
                 >
                   {busy === "Create Plan" ? "Planning…" : "Create Plan"}
                 </button>
-              </div>
-            </div>
-            {plan ? (
-              <div className="mt-3 space-y-2 text-xs">
-                <div className="flex items-center gap-2">
-                  <span className="text-muted-foreground">Strategy:</span>
-                  <strong>{String(planJson?.strategy ?? "")}</strong>
-                  <RiskBadge risk={String(planJson?.risk_level ?? "medium")} />
-                </div>
-                {dockerAi && (
-                  <div className="flex items-center gap-2">
-                    <span className="text-muted-foreground">AI provider:</span>
-                    <ProviderBadge provider={String(dockerAi.provider ?? "")} />
-                  </div>
-                )}
-                {serverState && (
-                  <div>
-                    <span className="text-muted-foreground">Detected: </span>
-                    {String(serverState.deployment_manager)} / {String(serverState.reverse_proxy)}
-                    {" "}({((Number(serverState.confidence) || 0) * 100).toFixed(0)}%)
-                  </div>
-                )}
-                {(planJson?.blocking_questions as string[] | undefined)?.length ? (
-                  <div className="rounded bg-destructive/10 p-2">
-                    <p className="font-semibold text-destructive">Blocking questions:</p>
-                    <ul className="mt-1 list-disc pl-4">
-                      {(planJson.blocking_questions as string[]).map((q, i) => (
-                        <li key={i}>{q}</li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <p className="mt-2 text-xs text-muted-foreground">No plan yet.</p>
-            )}
-
-            {/* Validation */}
-            {plan && (
-              <div className="mt-3 border-t border-border pt-3">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-semibold text-muted-foreground">Validation</span>
+                {plan && (
                   <button
                     onClick={() =>
                       void action("Validate", async () => {
@@ -417,98 +495,52 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
                   >
                     {busy === "Validate" ? "Validating…" : "Validate"}
                   </button>
-                </div>
-                {validation && (
-                  <div className="mt-2 text-xs">
-                    <span className={
-                      validation.status === "passed" ? "text-green-600"
-                      : validation.status === "blocked" ? "text-destructive"
-                      : "text-yellow-600"
-                    }>
-                      {validation.status.toUpperCase()}
-                    </span>
-                    {validation.blocking_errors.map((e, i) => (
-                      <p key={i} className="text-destructive">✗ {e}</p>
-                    ))}
-                    {validation.warnings.map((w, i) => (
-                      <p key={i} className="text-yellow-600">⚠ {w}</p>
-                    ))}
-                  </div>
                 )}
               </div>
+            </div>
+
+            {plan ? (
+              <PlanDetail
+                plan={plan}
+                target={selectedTarget}
+                validation={validation}
+              />
+            ) : (
+              <p className="mt-2 text-xs text-muted-foreground">
+                No plan yet. Run inventory and analysis first.
+              </p>
             )}
           </section>
 
-          {/* ---- 10. Approval + execute ---- */}
+          {/* ---- 10. Approval + execution ---- */}
           {plan && (
             <section className="rounded-xl border border-border bg-card p-4">
-              <h3 className="font-semibold">Approval &amp; Execution</h3>
-              <div className="mt-3 flex gap-2">
-                <button
-                  onClick={() =>
-                    void action("Approve", async () => {
-                      await approveDeploymentPlan(plan.id);
-                    })
-                  }
-                  disabled={
-                    busy !== null ||
-                    validation?.status === "blocked" ||
-                    plan.risk_level === "blocked"
-                  }
-                  className="rounded bg-green-600 px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-40"
-                  title={
-                    validation?.status === "blocked"
-                      ? "Validation must pass before approval"
-                      : undefined
-                  }
-                >
-                  {busy === "Approve" ? "Approving…" : "Approve"}
-                </button>
-                <button
-                  onClick={() =>
-                    void action("Deploy", async () => {
-                      const r = await executeDeploymentPlan(plan.id);
-                    })
-                  }
-                  disabled={busy !== null}
-                  className="rounded bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-40"
-                >
-                  {busy === "Deploy" ? "Deploying…" : "Execute Deploy"}
-                </button>
-              </div>
-              {validation?.status === "blocked" && (
-                <p className="mt-2 text-xs text-destructive">
-                  Resolve all blocking errors before approving.
-                </p>
-              )}
+              <h3 className="mb-3 font-semibold">Approval &amp; Execution</h3>
+              <ApprovalGates
+                plan={plan}
+                target={selectedTarget}
+                validation={validation}
+                approved={approved}
+                hasActiveRun={hasActiveRun}
+                rollbackAck={rollbackAck}
+                onRollbackAckChange={setRollbackAck}
+                onApprove={handleApprove}
+                onExecute={handleExecute}
+                onRunStarted={handleRunStarted}
+              />
             </section>
           )}
 
-          {/* ---- 12-13. Health + rollback ---- */}
+          {/* ---- 12-13. Deployment run ---- */}
           {run && (
             <section className="rounded-xl border border-border bg-card p-4">
-              <div className="flex items-center justify-between">
-                <h3 className="font-semibold">Deployment Run</h3>
-                {run.rollback_available === 1 && (
-                  <button
-                    onClick={() =>
-                      void action("Rollback", async () => {
-                        await rollbackDeploymentRun(run.id);
-                      })
-                    }
-                    disabled={busy !== null}
-                    className="rounded bg-destructive px-2 py-1 text-xs font-medium text-destructive-foreground disabled:opacity-50"
-                  >
-                    {busy === "Rollback" ? "Rolling back…" : "Rollback"}
-                  </button>
-                )}
-              </div>
-              <div className="mt-2 space-y-1 text-xs">
-                <p><span className="text-muted-foreground">Status: </span>{run.status}</p>
-                <p><span className="text-muted-foreground">Health: </span>{run.health_status}</p>
-                {run.started_at && <p><span className="text-muted-foreground">Started: </span>{run.started_at}</p>}
-                {run.finished_at && <p><span className="text-muted-foreground">Finished: </span>{run.finished_at}</p>}
-              </div>
+              <h3 className="mb-3 font-semibold">Deployment Run</h3>
+              <RunView
+                run={run}
+                steps={runSteps}
+                onRollback={() => void handleRollback()}
+                busyRollback={busy === "Rollback"}
+              />
             </section>
           )}
         </>

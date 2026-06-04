@@ -241,6 +241,7 @@ async def create_deployment_plan(
     deploy_path: str = "",
     created_by: str | None,
     db: aiosqlite.Connection,
+    plan_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Generate and persist a deployment plan. Returns (plan_id, plan_dict).
 
@@ -340,7 +341,7 @@ async def create_deployment_plan(
         ]
         plan["strategy"] = "manual_required"
 
-    plan_id = str(uuid.uuid4())
+    plan_id = plan_id or str(uuid.uuid4())
     plan_hash = compute_plan_hash(plan)
     await db.execute(
         """
