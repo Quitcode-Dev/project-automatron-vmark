@@ -250,6 +250,21 @@ class GitHubClient:
             response.raise_for_status()
             return response.text
 
+    async def get_pr_head_sha(self, owner: str, repo: str, pr_number: int) -> str | None:
+        """Return the current head SHA of a PR, or None if the PR isn't reachable.
+
+        Used to short-circuit the reviewer LLM when a PR's head hasn't changed
+        since the last review — avoids re-running an Opus/Sonnet review on the
+        same content every time the PR webhook fires.
+        """
+        try:
+            async with self._client() as client:
+                response = await client.get(f"/repos/{owner}/{repo}/pulls/{pr_number}")
+                response.raise_for_status()
+                return (response.json().get("head") or {}).get("sha")
+        except Exception:
+            return None
+
     async def post_pr_comment(
         self, owner: str, repo: str, pr_number: int, body: str
     ) -> None:

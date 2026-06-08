@@ -141,6 +141,15 @@ export async function restartProjectPreview(projectId: string): Promise<Project>
   });
 }
 
+export async function previewIssueBranch(
+  projectId: string,
+  issueNumber: number,
+): Promise<{ status: string; branch: string }> {
+  return request(`/api/projects/${projectId}/issues/${issueNumber}/preview`, {
+    method: "POST",
+  });
+}
+
 export async function getProjectPlan(
   projectId: string
 ): Promise<{ plan_md: string | null }> {
@@ -265,6 +274,17 @@ export async function implementWithAider(
   issueNumber: number
 ): Promise<{ status: string }> {
   return request(`/api/projects/${projectId}/issues/${issueNumber}/implement`, { method: "POST" });
+}
+
+export async function reimplementWithContext(
+  projectId: string,
+  issueNumber: number,
+  context: string,
+): Promise<{ status: string }> {
+  return request(
+    `/api/projects/${projectId}/issues/${issueNumber}/reimplement-with-context`,
+    { method: "POST", body: JSON.stringify({ context }) },
+  );
 }
 
 export async function reviewPR(

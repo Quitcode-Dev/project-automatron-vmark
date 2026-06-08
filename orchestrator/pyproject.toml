@@ -26,6 +26,9 @@ dependencies = [
     "python-jose[cryptography]>=3.3.0",
     "PyYAML>=6.0",
     "jsonschema>=4.21.0",
+    # Experimental builder via Anthropic Agent SDK tool-use loop.
+    # Used by orchestrator/builder/agent_sdk.py + scripts/compare_builders.py.
+    "anthropic>=0.40.0",
 ]
 
 [project.optional-dependencies]

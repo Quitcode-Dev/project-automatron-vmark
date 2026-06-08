@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -422,6 +423,26 @@ class GitHubOrchestrator:
 
         # Read repo context
         readme = await self.gh.read_file(owner, repo, "README.md") or ""
+
+        # Pre-architect scaffolding step. If main has no package.json AND the
+        # intake / README signals Next.js, push a vendored Next.js + Tailwind +
+        # shadcn skeleton to main as a single batch of commits BEFORE the
+        # architect plans any issues. Eliminates the recurring failure mode where
+        # the architect generates an "Initialize project" task that Aider can't
+        # actually fulfil (no shell exec, only file edits) — see the root-cause
+        # plan in /Users/qc3/.claude/plans/atomic-fluttering-duckling.md.
+        from orchestrator.scaffolding import maybe_scaffold_repo
+        scaffolded = await maybe_scaffold_repo(
+            self.gh, owner, repo,
+            intake_text=project.get("intake_text") or "",
+            readme=readme,
+            log_fn=self._log,
+        )
+        if scaffolded:
+            # Re-read README so the architect sees any scaffold-added README
+            # content (currently a no-op since the fixture doesn't touch README,
+            # but keeps the contract clean for future framework adapters).
+            readme = await self.gh.read_file(owner, repo, "README.md") or readme
 
         # Auto-discover docs — scan root + docs/ folder, read all .md files up to 3 levels deep
         docs_content = ""
@@ -915,8 +936,15 @@ class GitHubOrchestrator:
             elif src.startswith("~/"):
                 base = "src/" + src[2:]
             elif src.startswith(("./", "../")) and from_file:
-                from pathlib import PurePosixPath
-                base = str((PurePosixPath(from_file).parent / src).resolve()).lstrip("/")
+                # posixpath.normpath handles ./ and ../ without touching the
+                # filesystem. PurePosixPath has no .resolve() (that's only on
+                # the concrete Path class) — using it raises AttributeError.
+                import posixpath
+                from_dir = posixpath.dirname(from_file)
+                base = posixpath.normpath(posixpath.join(from_dir, src)).lstrip("/")
+                # Block paths that escape the repo root (e.g. ../../etc/passwd)
+                if base.startswith("../") or base == "..":
+                    return []
             else:
                 return []
             # Try common extensions / index files
@@ -971,6 +999,25 @@ class GitHubOrchestrator:
         self._set_trace("pr_review", "reviewer")
         await self._log(f"Reviewing PR #{pr_number}", f"Issue #{issue_number} · {owner}/{repo}")
 
+        # Short-circuit if we already reviewed this exact PR head SHA. Every PR
+        # `opened`/`reopened` webhook fires a fresh review, but a chain of
+        # auto-pushes to the same PR (re-impl loop, retry path, etc.) can fire
+        # the webhook 3-5 times in a row with NO code change between firings.
+        # Re-running the reviewer LLM each time burns expensive tokens for
+        # identical output. Cache by head SHA.
+        head_sha = await self.gh.get_pr_head_sha(owner, repo, pr_number)
+        if head_sha:
+            from orchestrator.models.project import _get_github_issue
+            existing_local = await _get_github_issue(self.project_id, issue_number)
+            existing_review = (existing_local or {}).get("pr_review") or {}
+            if existing_review.get("head_sha") == head_sha:
+                await self._log(
+                    f"Reviewer: PR #{pr_number} head unchanged — skipping",
+                    f"head_sha {head_sha[:8]} matches the last review on record",
+                    "INFO",
+                )
+                return
+
         # Get diff and task spec (issue body)
         diff = await self.gh.get_pr_diff(owner, repo, pr_number)
         issue = await self.gh.get_issue(owner, repo, issue_number)
@@ -991,6 +1038,28 @@ class GitHubOrchestrator:
             "Additionally: confirm every call site in the diff matches the signature of the function "
             "it calls (argument count and types), and confirm every imported symbol actually exists in "
             "the referenced module.\n\n"
+            "## Next.js route group equivalence\n"
+            "When evaluating Next.js App Router file paths, treat `app/(group)/X/page.tsx` and "
+            "`app/X/page.tsx` as **equivalent routes** — they both resolve to `/X`. If the spec "
+            "specified one form and the implementation used the other, note it under \"What was done "
+            "well\" (the layout from `(group)/layout.tsx` will only wrap the in-group form), do NOT "
+            "flag it under Issues. The same equivalence applies to sibling files like `actions.ts`, "
+            "`loading.tsx`, `error.tsx` that live next to the page. Exception: if BOTH copies exist "
+            "on disk simultaneously, that's a duplicate-route build error — flag THAT.\n\n"
+            "## What counts as an Issue\n"
+            "The Issues section is ONLY for things you have CONFIRMED are broken — real bugs, "
+            "signature mismatches, missing required files, failed acceptance criteria, type errors "
+            "you can verify from the imported signatures.\n"
+            "Do NOT put under Issues:\n"
+            "- **Verifications that passed.** If an import is valid, a signature matches, a "
+            "criterion is met — put it under \"What was done well\" or omit it. A bullet that ends "
+            "in ✓ or contains \"this is correct / valid / matches / satisfies\" does NOT belong in Issues.\n"
+            "- **Speculative concerns** (\"may complain\", \"could fail\", \"potentially\", "
+            "\"depending on version\", \"if X is not typed as Y…\"). Either verify the concern using "
+            "the imported signatures and stack files OR omit it. Unverified hedged concerns are noise.\n"
+            "- **Additive code that doesn't break anything** (extra test cases, extra exports the "
+            "spec didn't ask for). Note them under \"What was done well\" if worth mentioning.\n"
+            "- **Stylistic preferences** unless they violate stated implementation_notes.\n\n"
             "## Pass/fail rules — strict\n"
             "- Output **PASSED** ONLY if every acceptance criterion is met AND there are no correctness "
             "issues to list under the Issues section.\n"
@@ -1032,40 +1101,89 @@ class GitHubOrchestrator:
             user_msg += f"\n\n---\n\n{skill_context}"
 
         try:
-            review_text = await call_llm(
-                [SystemMessage(content=system_prompt), HumanMessage(content=user_msg)],
-                model=model,
-                max_tokens=2048,
-                trace_context={**self._trace_ctx, "actor": "reviewer"},
+            # Hard timeout so a hung LLM provider can't lock the issue in
+            # "reviewing" forever. 3 minutes is generous for a 2k-output review.
+            review_text = await asyncio.wait_for(
+                call_llm(
+                    [SystemMessage(content=system_prompt), HumanMessage(content=user_msg)],
+                    model=model,
+                    max_tokens=2048,
+                    trace_context={**self._trace_ctx, "actor": "reviewer"},
+                ),
+                timeout=180,
             )
+        except asyncio.TimeoutError:
+            await self._log(f"PR #{pr_number} review timed out", "LLM call exceeded 180s", "ERROR")
+            await emit_error(self.project_id, f"PR review timed out after 3 min for PR #{pr_number}")
+            return
         except Exception as exc:
             await emit_error(self.project_id, f"PR review failed: {exc}")
             return
 
         passed = review_text.strip().upper().startswith("PASSED")
 
-        # Safety net: model sometimes writes "PASSED" then lists real issues anyway.
-        # If we see an "Issues" section with substantive bullet points, override to fail.
-        if passed:
-            issues_section = re.search(
-                r'(?:^|\n)\s*(?:##\s*|[*]+\s*)?(?:Issues|Issues found|Problems|Concerns)[:\s]*\n((?:.|\n)*?)(?=\n\s*(?:##|[*]+\s*(?:Strengths|What was done well|Praise))|$)',
-                review_text,
+        # Safety net works both directions:
+        # (a) Model wrote PASSED but listed real issues → override to ISSUES FOUND.
+        # (b) Model wrote ISSUES FOUND but every bullet is a ✓-confirmed verification
+        #     or a hedged speculative concern → override to PASSED.
+        # Compute the substantive-issue count once and decide.
+        #
+        # The outer regex REQUIRES a real markdown heading prefix (`## ` or `**`).
+        # Without that requirement, the regex falsely anchors on the verdict line
+        # `ISSUES FOUND` (case-insensitive `Issues found`) and captures the summary
+        # paragraph, finds zero bullets, and the (b) branch wrongly flips to PASSED.
+        # `Issues found` is also dropped from the alternatives — it's the verdict, not a heading.
+        issues_section = re.search(
+            r'(?:^|\n)(?:##\s+|\*\*\s*)(?:Issues|Problems|Concerns)\b\*?\*?[:\s]*\n((?:.|\n)*?)(?=\n\s*(?:##|\*\*(?:Strengths|What was done well|Praise))|$)',
+            review_text,
+            re.IGNORECASE,
+        )
+        bullets: list[str] = []
+        substantive: list[str] = []
+        if issues_section:
+            bullets = re.findall(r'^\s*[-*]\s+(.+)$', issues_section.group(1), re.MULTILINE)
+            # Patterns that mark a bullet as a ✓-confirmed verification, not an issue
+            _confirm_pat = re.compile(
+                r'(?:[✓✔☑]|\bthis is correct\b|\bis valid\b|\bmatches the spec\b|'
+                r'\bsatisfies the criterion\b|\bis correctly\b|\bcorrectly handles\b|'
+                r'\bcorrectly implements\b|\bare correctly defined\b|\bmatch the spec\b|'
+                r'\bis present\b|\bis fine\b|\bok here\b|\bnot a missing criterion\b)',
                 re.IGNORECASE,
             )
-            if issues_section:
-                bullets = re.findall(r'^\s*[-*]\s+(.+)$', issues_section.group(1), re.MULTILINE)
-                # Filter out trivially-empty or "no issues"-style bullets
-                substantive = [
-                    b for b in bullets
-                    if len(b.strip()) > 25
-                    and not re.match(r'^\s*(none|n/a|no issues|nothing|—)\s*$', b.strip(), re.IGNORECASE)
-                ]
-                if substantive:
-                    logger.warning(
-                        "PR review: model wrote PASSED but listed %d substantive issue(s) — overriding to ISSUES FOUND",
-                        len(substantive),
-                    )
-                    passed = False
+            # Hedged speculation patterns — concerns the model didn't verify
+            _speculative_pat = re.compile(
+                r'\b(?:may complain|could fail|potentially|depending on (?:the )?(?:next\.?js )?version|'
+                r'if .+ is not typed|might cause|may produce|may fail|likely to|could be a)\b',
+                re.IGNORECASE,
+            )
+            for b in bullets:
+                bs = b.strip()
+                if len(bs) <= 25:
+                    continue
+                if re.match(r'^\s*(none|n/a|no issues|nothing|—)\s*$', bs, re.IGNORECASE):
+                    continue
+                if _confirm_pat.search(bs):
+                    continue
+                if _speculative_pat.search(bs):
+                    continue
+                substantive.append(bs)
+
+        if passed and substantive:
+            logger.warning(
+                "PR review: model wrote PASSED but listed %d substantive issue(s) — overriding to ISSUES FOUND",
+                len(substantive),
+            )
+            passed = False
+        elif not passed and issues_section is not None and bullets and not substantive:
+            # Guard: only flip ISSUES FOUND → PASSED when we actually parsed a real
+            # Issues section with bullets that ALL got filtered. Empty section or
+            # missing section → trust the model's verdict.
+            logger.warning(
+                "PR review: model wrote ISSUES FOUND but all %d bullet(s) were ✓-confirmed or "
+                "speculative — overriding to PASSED",
+                len(bullets),
+            )
+            passed = True
 
         await self._log(
             f"PR #{pr_number} review: {'PASSED' if passed else 'ISSUES FOUND'}",
@@ -1077,6 +1195,7 @@ class GitHubOrchestrator:
             "summary": review_text,
             "pr_number": pr_number,
             "issue_number": issue_number,
+            "head_sha": head_sha,  # for cache-skip on next webhook firing
         }
 
         await update_github_issue_pr(
@@ -1546,8 +1665,15 @@ async def assign_to_copilot_issue(project_id: str, issue_number: int) -> dict:
     return {"assigned": 1, "issue_number": issue_number}
 
 
-async def implement_with_aider(project_id: str, issue_number: int) -> None:
-    """Clone the repo, run Aider on the issue, push a branch, open a PR."""
+async def implement_with_aider(
+    project_id: str, issue_number: int, extra_context: str | None = None,
+) -> None:
+    """Clone the repo, run Aider on the issue, push a branch, open a PR.
+
+    `extra_context`, when provided, is appended to the issue body before Aider
+    sees it. Used by the "Send to Aider" button on ERROR-level activity rows so
+    a build error / type error / runtime crash gets fed back as a fix directive.
+    """
     from orchestrator.aider_agent import implement_issue
     from orchestrator.models.project import update_github_issue_pr
 
@@ -1582,37 +1708,88 @@ async def implement_with_aider(project_id: str, issue_number: int) -> None:
             f"Address all issues listed above in your implementation."
         )
 
+    if extra_context:
+        # Prepend, not append. When extra_context lived at the bottom of a
+        # multi-KB spec, the LLM treated it as a footnote and kept executing
+        # the top-level spec — producing zero diff (everything already done)
+        # and falling back to .gitignore housekeeping. Hoisted to the top
+        # and framed as the PRIMARY directive, it dominates Aider's attention.
+        issue_body = (
+            f"# PRIMARY DIRECTIVE — Fix this error\n\n"
+            f"This issue was previously implemented. A subsequent build or runtime "
+            f"error was reported on the branch. Your PRIMARY task is to fix the error "
+            f"below. The original spec is preserved further down as **reference only**: "
+            f"do not re-implement files that already work — only patch what the error "
+            f"says is broken. The error often names the exact file and line.\n\n"
+            f"## Error to fix\n\n"
+            f"{extra_context}\n\n"
+            f"---\n\n"
+            f"## Original issue spec (reference only — do NOT re-implement)\n\n"
+            f"{issue_body}"
+        )
+
     llm_cfg = await orch._llm_config()
-    model = llm_cfg.get("builder", {}).get("model", "anthropic/claude-sonnet-4-6")
+    builder_cfg = llm_cfg.get("builder", {}) or {}
+    model = builder_cfg.get("model", "anthropic/claude-sonnet-4-6")
+    engine = (builder_cfg.get("engine") or "aider").strip().lower()
     # Remove internal claude/ prefix if present; keep anthropic/ for LiteLLM routing
     model = model.replace("claude/", "")
     # Validate model — fall back if it looks like a hallucinated or unrecognized name
     _KNOWN_PREFIXES = ("anthropic/", "claude-", "gpt-4", "gpt-4o", "openai/", "gemini", "deepseek")
     _is_gpt = model.startswith(("gpt-", "openai/"))
     if not any(model.startswith(p) for p in _KNOWN_PREFIXES) or (_is_gpt and not settings.openai_api_key):
-        logger.warning("Aider: unrecognized or unconfigured model %r — falling back to claude-sonnet-4-6", model)
+        logger.warning("Builder: unrecognized or unconfigured model %r — falling back to claude-sonnet-4-6", model)
         model = "anthropic/claude-sonnet-4-6"
 
     is_reimplementation = bool(existing_pr_number)
     action = "re-implementing" if is_reimplementation else "starting"
-    await orch._log(f"Aider {action} on #{issue_number}", issue_title, "RUNNING")
+    engine_label = "Aider" if engine == "aider" else "Agent SDK"
+    await orch._log(f"{engine_label} {action} on #{issue_number}", issue_title, "RUNNING")
 
-    # Set "implementing" status immediately so the UI shows "Working…" while Aider runs
+    # Set "implementing" status immediately so the UI shows "Working…" while the builder runs
     from orchestrator.models.project import update_github_issue_status, list_github_issues as _list_issues
     await update_github_issue_status(project_id, issue_number, "implementing")
     await emit_issues_updated(project_id, await _list_issues(project_id))
 
-    branch, failure_reason = await implement_issue(
-        project_id=project_id,
-        owner=owner,
-        repo=repo,
-        issue_number=issue_number,
-        issue_title=issue_title,
-        issue_body=issue_body,
-        default_branch=default_branch,
-        model=model,
-        is_reimplementation=is_reimplementation,
-    )
+    if engine == "agent_sdk":
+        from orchestrator.builder.agent_sdk import implement_issue_via_agent_sdk
+        # Agent SDK takes the raw model name (no LiteLLM "anthropic/" prefix).
+        sdk_model = model.removeprefix("anthropic/")
+        branch, failure_reason, usage = await implement_issue_via_agent_sdk(
+            project_id=project_id,
+            owner=owner,
+            repo=repo,
+            issue_number=issue_number,
+            issue_title=issue_title,
+            issue_body=issue_body,
+            default_branch=default_branch,
+            model=sdk_model,
+            is_reimplementation=is_reimplementation,
+            extra_context=None,  # already prepended above for both engines
+        )
+        # Surface cost in activity log so the UI shows the cheaper engine's wins.
+        await orch._log(
+            f"Agent SDK done for #{issue_number}",
+            (
+                f"iterations={usage.iterations} • tool_calls={usage.tool_calls} • "
+                f"in={usage.input_tokens} • out={usage.output_tokens} • "
+                f"cache_r={usage.cache_read_input_tokens} • cache_w={usage.cache_creation_input_tokens} • "
+                f"~${usage.estimated_cost_usd(model):.4f}"
+            ),
+            "INFO" if branch else "AMBIGUITY",
+        )
+    else:
+        branch, failure_reason = await implement_issue(
+            project_id=project_id,
+            owner=owner,
+            repo=repo,
+            issue_number=issue_number,
+            issue_title=issue_title,
+            issue_body=issue_body,
+            default_branch=default_branch,
+            model=model,
+            is_reimplementation=is_reimplementation,
+        )
 
     if not branch:
         detail = failure_reason or "unknown error"

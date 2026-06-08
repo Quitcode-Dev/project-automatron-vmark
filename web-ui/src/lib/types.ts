@@ -32,14 +32,23 @@ export interface StackConfig {
 export type LlmProvider = "openai" | "anthropic" | "google";
 export type DeployAuthMode = "ssh_key" | "password";
 
+export type BuilderEngine = "aider" | "agent_sdk";
+
 export interface LlmRoleConfig {
   provider: LlmProvider;
   model: string;
 }
 
+export interface BuilderRoleConfig extends LlmRoleConfig {
+  /** Which builder engine drives this project's implementation runs.
+   *  "aider" (default) = current production path. "agent_sdk" = experimental
+   *  Anthropic tool-use loop with prompt caching. See orchestrator/builder/. */
+  engine?: BuilderEngine;
+}
+
 export interface ProjectLlmConfig {
   architect: LlmRoleConfig;
-  builder: LlmRoleConfig;
+  builder: BuilderRoleConfig;
   reviewer: LlmRoleConfig;
 }
 

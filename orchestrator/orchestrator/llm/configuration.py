@@ -8,8 +8,11 @@ from orchestrator.config import settings
 
 LlmProvider = Literal["openai", "anthropic", "google"]
 LlmRole = Literal["architect", "builder", "reviewer"]
+BuilderEngine = Literal["aider", "agent_sdk"]
 
 SUPPORTED_PROVIDERS: tuple[LlmProvider, ...] = ("openai", "anthropic", "google")
+SUPPORTED_BUILDER_ENGINES: tuple[BuilderEngine, ...] = ("aider", "agent_sdk")
+DEFAULT_BUILDER_ENGINE: BuilderEngine = "aider"
 
 
 def infer_provider_from_model(model: str, fallback: LlmProvider = "openai") -> LlmProvider:
@@ -68,14 +71,25 @@ def default_model_for_role(role: LlmRole) -> str:
     return settings.architect_model
 
 
+def normalize_builder_engine(engine: str | None) -> BuilderEngine:
+    value = (engine or "").strip().lower()
+    if value in SUPPORTED_BUILDER_ENGINES:
+        return value  # type: ignore[return-value]
+    return DEFAULT_BUILDER_ENGINE
+
+
 def default_llm_config() -> dict[str, dict[str, str]]:
-    return {
+    result: dict[str, dict[str, str]] = {
         role: {
             "provider": infer_provider_from_model(default_model_for_role(role), fallback="openai"),
             "model": default_model_for_role(role),
         }
         for role in ("architect", "builder", "reviewer")
     }
+    # Builder gets an extra `engine` field — Aider subprocess vs Anthropic
+    # Agent SDK tool-loop. Default stays Aider while agent_sdk matures.
+    result["builder"]["engine"] = DEFAULT_BUILDER_ENGINE
+    return result
 
 
 def normalize_llm_config(llm_config: dict | None) -> dict[str, dict[str, str]]:
@@ -96,4 +110,7 @@ def normalize_llm_config(llm_config: dict | None) -> dict[str, dict[str, str]]:
             "provider": provider,
             "model": normalize_model_identifier(provider, model),
         }
+    # Preserve / normalise the builder engine selection.
+    builder_cfg = llm_config.get("builder") if isinstance(llm_config.get("builder"), dict) else {}
+    result["builder"]["engine"] = normalize_builder_engine(builder_cfg.get("engine"))  # type: ignore[arg-type]
     return result

@@ -332,6 +332,240 @@ async def _implement_untouched_files(
     return sum(1 for fp in untouched if fp in touched_now)
 
 
+async def _enforce_aider_deletions(repo_dir: Path, default_branch: str) -> int:
+    """Aider regularly writes commit messages claiming it deleted a file but never
+    actually runs `git rm` — the file is still present (sometimes emptied, sometimes
+    untouched). This breaks re-implement loops because the reviewer flags the same
+    stray file every round.
+
+    Parse this branch's commit messages for "delete <path>" / "remove <path>" intents
+    and force-delete any matching files that still exist.
+    Returns the number of files removed.
+    """
+    rc, log_out = await _run(
+        ["git", "log", "--format=%B%n---END-COMMIT---", f"origin/{default_branch}..HEAD"],
+        cwd=repo_dir,
+    )
+    if rc != 0 or not log_out.strip():
+        return 0
+
+    # Match: verb (delete/remove/drop/unlink/rm/move/rename/relocate/migrate) followed
+    # by a backtick-quoted path, or a path-like token (must contain `/` or `.`) to
+    # reduce false positives. The move/rename verbs are critical — Aider regularly
+    # claims to MOVE a file (which should equal `git mv` = delete-old + create-new)
+    # but only performs the create-new half.
+    intent_re = re.compile(
+        r"\b(?:delete[ds]?|remove[ds]?|drop[ped]?|unlink|rm"
+        r"|move[ds]?|moved|rename[ds]?|renamed|relocate[ds]?|relocated|migrate[ds]?|migrated)"
+        r"\b[^\n]{0,80}?"
+        r"(?:`([^`\n]+)`|\"([^\"\n]+)\"|'([^'\n]+)'|([\w][\w./\- ]*[\w]))",
+        re.IGNORECASE,
+    )
+
+    candidates: set[str] = set()
+    for m in intent_re.finditer(log_out):
+        raw = next((g for g in m.groups() if g), "").strip().strip("`'\"")
+        if not raw or len(raw) > 200:
+            continue
+        # Must look like a file path: contains "/" or "." OR is a tab-suffixed garbage name
+        if "/" not in raw and "." not in raw and "\t" not in raw:
+            continue
+        # Strip trailing punctuation that often grabs onto path tokens
+        raw = raw.rstrip(".,;:)]}")
+        # Must actually exist in the working tree, otherwise nothing to enforce
+        if (repo_dir / raw).exists() and (repo_dir / raw).is_file():
+            candidates.add(raw)
+
+    if not candidates:
+        return 0
+
+    # Force delete via git rm
+    paths_list = sorted(candidates)
+    rc_rm, rm_out = await _run(
+        ["git", "rm", "-f", "--", *paths_list],
+        cwd=repo_dir,
+    )
+    if rc_rm != 0:
+        logger.warning("Aider deletion enforcement: git rm failed: %s", rm_out[-300:])
+        return 0
+
+    await _run(
+        ["git", "commit", "-m",
+         f"chore: enforce {len(paths_list)} delete(s) Aider claimed but didn't perform\n\n"
+         + "\n".join(f"- {p}" for p in paths_list)],
+        cwd=repo_dir,
+    )
+    logger.warning(
+        "Aider deletion enforcement: removed %d file(s) Aider claimed to delete: %s",
+        len(paths_list), paths_list,
+    )
+    return len(paths_list)
+
+
+def _nextjs_route_url(rel_path: str) -> str | None:
+    """Compute the URL a Next.js App Router file resolves to, stripping (group) segments.
+
+    Returns None when the file isn't an App Router routing file. Matches Next.js's
+    actual rule: parens-wrapped directory segments are organisational only and do
+    not appear in the URL.
+    """
+    # Normalise to forward slashes
+    p = rel_path.replace("\\", "/")
+    # Strip leading `src/app/` or `app/` — everything before the route segments
+    for prefix in ("src/app/", "app/"):
+        if p.startswith(prefix):
+            p = p[len(prefix):]
+            break
+    else:
+        return None
+
+    parts = p.split("/")
+    leaf = parts[-1]
+    if leaf not in _NEXTJS_ROUTE_FILES:
+        return None
+    # `layout.tsx` / `loading.tsx` / `error.tsx` etc. don't define a route URL by
+    # themselves — only page.* and route.* do.
+    if not (leaf.startswith("page.") or leaf.startswith("route.")):
+        return None
+
+    # Build URL from the directory segments, dropping (group) parens
+    segments = [s for s in parts[:-1] if not (s.startswith("(") and s.endswith(")"))]
+    return "/" + "/".join(segments) if segments else "/"
+
+
+async def _remove_bogus_root_files(repo_dir: Path, default_branch: str) -> int:
+    """Delete repo-root files Aider created from misparsed issue-body content.
+
+    Aider's whole-edit format treats the line preceding a code fence as a
+    filename. When the issue body contains setup instructions like
+    `SUPABASE_SERVICE_ROLE_KEY=your-service-role-key` or shell command snippets
+    (`npm install`, `npm run build`) shown in code blocks, the LLM emits them
+    as file blocks and Aider writes them as literal files in the repo root.
+
+    Detects new (vs default_branch) files in the repo root whose names contain
+    characters that no real source/config file would use: `=`, whitespace,
+    `:`, `;`, or start with a shell-command prefix like `npm `, `yarn `,
+    `pnpm `, `pip `, `python `. Returns the number deleted.
+
+    Skips files in any subdirectory — only repo-root files are checked,
+    because that's where parser artifacts land. Dot-files in root (.env,
+    .gitignore, .nvmrc) are NOT skipped — those have their own validators
+    elsewhere, and a bogus file named `.env.local=secret` IS the kind of
+    artifact we want to catch.
+    """
+    # List new files added vs default_branch (so we never touch pre-existing files)
+    rc, out = await _run(
+        ["git", "diff", "--name-only", "--diff-filter=A", f"origin/{default_branch}..HEAD"],
+        cwd=repo_dir,
+    )
+    if rc != 0:
+        logger.warning("_remove_bogus_root_files: git diff failed: %s", out[-200:])
+        return 0
+
+    _SHELL_PREFIXES = ("npm ", "yarn ", "pnpm ", "pip ", "python ", "node ", "bun ", "deno ", "uvx ", "uv ", "git ", "gh ", "docker ", "supabase ")
+    _SHELL_CHARS = set("=: ;\t\n")
+
+    bogus: list[str] = []
+    for rel_raw in out.splitlines():
+        rel = rel_raw.strip()
+        if not rel:
+            continue
+        # Only repo-root files
+        if "/" in rel:
+            continue
+        name = rel
+        is_shelly = any(name.startswith(p) for p in _SHELL_PREFIXES)
+        has_bad_char = any(c in name for c in _SHELL_CHARS)
+        if is_shelly or has_bad_char:
+            bogus.append(rel)
+
+    if not bogus:
+        return 0
+
+    logger.warning("Removing %d bogus root file(s) created by Aider parser misread: %s", len(bogus), bogus)
+    rc, out = await _run(["git", "rm", "-f", "--", *bogus], cwd=repo_dir)
+    if rc != 0:
+        logger.warning("_remove_bogus_root_files: git rm failed: %s", out[-200:])
+        return 0
+    await _run(
+        ["git",
+         "-c", "user.email=automatron@automatron.local",
+         "-c", "user.name=Automatron Sanitiser",
+         "commit", "-m",
+         f"chore: remove {len(bogus)} bogus root file(s) from Aider misparse"],
+        cwd=repo_dir,
+    )
+    return len(bogus)
+
+
+async def _resolve_route_collisions(repo_dir: Path, default_branch: str) -> int:
+    """Detect Next.js routes whose URL is claimed by more than one page/route file
+    and delete the loser. Common after Aider tries to "move" a page into a route
+    group but doesn't delete the original — both files resolve to the same URL and
+    `next build` fails with a parallel-pages error.
+
+    Resolution priority (keep, discard rest):
+      1. File whose path contains a `(group)` segment (more intentional placement)
+      2. If still tied, alphabetically smallest path (deterministic)
+      3. Otherwise, the file with the shortest path
+    Returns the number of files deleted.
+    """
+    app_root = None
+    for candidate in (repo_dir / "src" / "app", repo_dir / "app"):
+        if candidate.is_dir():
+            app_root = candidate
+            break
+    if app_root is None:
+        return 0
+
+    by_url: dict[str, list[str]] = {}
+    for f in app_root.rglob("*"):
+        if not f.is_file():
+            continue
+        rel = str(f.relative_to(repo_dir))
+        url = _nextjs_route_url(rel)
+        if url is None:
+            continue
+        by_url.setdefault(url, []).append(rel)
+
+    deleted = 0
+    for url, files in by_url.items():
+        if len(files) < 2:
+            continue
+        # Sort so the preferred keep is at index 0
+        def _keep_key(path: str) -> tuple[int, int, str]:
+            in_group = 0 if "(" in path and ")" in path else 1
+            return (in_group, len(path), path)
+        files.sort(key=_keep_key)
+        keep, losers = files[0], files[1:]
+        logger.warning(
+            "Route collision at %s: keeping %s, deleting %s",
+            url, keep, losers,
+        )
+        # Also clean up sibling artefacts living next to the loser page (e.g. the
+        # matching actions.ts / loading.tsx) so we don't leak orphans.
+        extras: list[str] = []
+        for loser in losers:
+            loser_dir = (repo_dir / loser).parent
+            for sibling in loser_dir.iterdir():
+                if sibling.is_file() and str(sibling.relative_to(repo_dir)) != loser:
+                    extras.append(str(sibling.relative_to(repo_dir)))
+        to_delete = losers + extras
+        rc, out = await _run(["git", "rm", "-f", "--", *to_delete], cwd=repo_dir)
+        if rc != 0:
+            logger.warning("Route-collision cleanup: git rm failed for %s: %s", url, out[-200:])
+            continue
+        deleted += len(to_delete)
+
+    if deleted:
+        await _run(
+            ["git", "commit", "-m",
+             f"chore: resolve {deleted} Next.js route collision file(s)"],
+            cwd=repo_dir,
+        )
+    return deleted
+
+
 async def _fix_duplicated_paths(repo_dir: Path, default_branch: str) -> int:
     """Detect files committed at paths with duplicated segments and move them.
 
@@ -523,17 +757,79 @@ async def _implement_issue_locked(
 
     if is_reimplementation and branch_on_remote:
         logger.info("Aider: continuing from existing branch %s for issue #%d", branch, issue_number)
+        # Defensive: clear any half-merge left by a killed prior process.
+        # The current working tree may also be dirty from a prior run — get
+        # rid of all uncommitted/untracked state BEFORE the checkout+merge
+        # so the merge doesn't fail with "untracked files would be overwritten".
+        await _run(["git", "merge", "--abort"], cwd=repo_dir)
         await _run(["git", "checkout", "-B", branch, f"origin/{branch}"], cwd=repo_dir)
+        await _run(["git", "reset", "--hard", f"origin/{branch}"], cwd=repo_dir)
+        await _run(["git", "clean", "-fd"], cwd=repo_dir)
+        # Compose with main: merge default_branch into the branch so the
+        # workspace (and the pre-push build check) reflects what shipping
+        # this PR would actually produce. Without this, a re-implementation
+        # branch cut from an older main misses any commits that landed on
+        # main afterwards (e.g. orchestrator-managed scaffolding), and the
+        # pre-push build check silently SKIPS (no package.json) → broken
+        # code reaches GitHub.
+        merge_rc, merge_out = await _run(
+            [
+                "git",
+                "-c", "user.email=aider@automatron.local",
+                "-c", "user.name=Automatron Aider",
+                "merge", "--no-edit", f"origin/{default_branch}",
+            ],
+            cwd=repo_dir,
+        )
+        if merge_rc != 0:
+            _, conflicts_out = await _run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=repo_dir)
+            await _run(["git", "merge", "--abort"], cwd=repo_dir)
+            conflicts = conflicts_out.strip()
+            # When --diff-filter=U is empty, the merge aborted before reaching
+            # a 3-way merge (e.g. "untracked working tree files would be
+            # overwritten by merge"). Surface git's actual stderr instead of
+            # saying "(unknown)" — that diagnostic was a dead end for the user.
+            if conflicts:
+                detail_for_user = f"Merge conflict between `{default_branch}` and `{branch}` in files:\n{conflicts}"
+                detail_for_log = f"Conflicting files:\n{conflicts}\n\nGit output:\n{merge_out[-1500:]}"
+            else:
+                tail = merge_out.strip()[-800:] or "(no output)"
+                detail_for_user = (
+                    f"`git merge {default_branch}` into `{branch}` failed without producing a conflict list "
+                    f"(the merge was rejected before a 3-way merge). Git said:\n```\n{tail}\n```"
+                )
+                detail_for_log = f"No conflict list returned. Full git output:\n{merge_out[-1500:]}"
+            logger.error(
+                "Aider: merge of %s into %s failed for issue #%d:\n%s",
+                default_branch, branch, issue_number, merge_out,
+            )
+            try:
+                from orchestrator.models.project import save_activity_log, get_activity_logs
+                existing = await get_activity_logs(project_id)
+                seq = (max((r.get("seq", 0) for r in existing), default=0) + 1)
+                await save_activity_log(
+                    project_id, seq,
+                    f"Aider: merge from `{default_branch}` failed for issue #{issue_number}",
+                    detail_for_log,
+                    "ERROR",
+                )
+            except Exception as exc:
+                logger.warning("Aider: failed to persist merge failure to activity log: %s", exc)
+            return None, f"{detail_for_user}\n\nResolve on GitHub (rebase or merge) and re-run Implement."
+        logger.info(
+            "Aider: merged %s into %s for issue #%d (compose-on-main)",
+            default_branch, branch, issue_number,
+        )
     else:
         logger.info("Aider: resetting to %s for issue #%d", default_branch, issue_number)
         await _run(["git", "checkout", default_branch], cwd=repo_dir)
         await _run(["git", "reset", "--hard", f"origin/{default_branch}"], cwd=repo_dir)
         await _run(["git", "checkout", "-B", branch], cwd=repo_dir)
 
-    # Remove untracked files left over from prior runs (e.g. empty placeholder
-    # directories Aider created that were never committed). Respects .gitignore so
-    # node_modules/.next survive. Without this, stale files sabotage subsequent builds.
-    await _run(["git", "clean", "-fd"], cwd=repo_dir)
+        # Remove untracked files left over from prior runs (e.g. empty placeholder
+        # directories Aider created that were never committed). Respects .gitignore so
+        # node_modules/.next survive. Without this, stale files sabotage subsequent builds.
+        await _run(["git", "clean", "-fd"], cwd=repo_dir)
 
     # Re-implementation: diff patches only the broken parts in existing files on the branch.
     # Fresh implementation: whole writes complete new files from scratch (diff needs files
@@ -595,6 +891,17 @@ async def _implement_issue_locked(
         f"Implement the task described above. Follow all implementation notes and "
         f"acceptance criteria exactly. Write complete, working file contents for every "
         f"file you create or modify.{scratch_note}{reimpl_note}{preserve_note}"
+        f"\n\nSHELL COMMANDS AND ENV-VAR ASSIGNMENTS ARE NEVER FILENAMES. "
+        f"The issue body may show shell commands inside code fences "
+        f"(```\\nnpm install\\n```) or env-var examples "
+        f"(```\\nSUPABASE_URL=https://...\\n```) as part of setup instructions. "
+        f"These are NOT files to create — they are documentation. "
+        f"A real filename always ends in a file extension (`.tsx`, `.ts`, `.js`, "
+        f"`.json`, `.md`, `.css`, `.mjs`, `.cjs`, `.yml`, `.yaml`, `.toml`, `.sql`, "
+        f"`.env`, `.gitignore`, or similar) or matches a known config-root name "
+        f"(`Dockerfile`, `Makefile`, `LICENSE`, `README`). If you see a line like "
+        f"`npm run build` or `KEY=value` preceding a code block, treat it as the "
+        f"START of a command/env example, NOT a filename."
     )
 
     env = {**os.environ}
@@ -614,6 +921,11 @@ async def _implement_issue_locked(
         "--map-tokens", "4096",
         "--git",
         "--auto-commits",
+        # Anthropic prompt caching: cuts repeated-context input cost by ~90%.
+        # Aider's diff format resends the full --file content on every internal
+        # turn; without caching, an iteration that loops 4 turns pays 4× input
+        # tokens. Free 50-80% saving on Anthropic models at no quality cost.
+        "--cache-prompts",
     ]
 
     # Aider v0.86+ exits without any LLM call when no --file args are supplied.
@@ -715,6 +1027,28 @@ async def _implement_issue_locked(
     if fixed_nextjs:
         logger.info("Aider: moved %d misplaced Next.js page file(s) for issue #%d", fixed_nextjs, issue_number)
 
+    # Enforce file deletions Aider claimed in commit messages but didn't perform
+    # (recurring failure mode — reviewer flags the stray file every re-implement round).
+    enforced = await _enforce_aider_deletions(repo_dir, default_branch)
+    if enforced:
+        logger.info("Aider: enforced %d deletion(s) for issue #%d", enforced, issue_number)
+
+    # Detect & resolve Next.js route collisions (two page.tsx → /same-url → build fail).
+    # Run AFTER enforcement so any deletions Aider claimed but didn't perform are
+    # gone first — collisions remaining at this point are the structural ones.
+    collisions = await _resolve_route_collisions(repo_dir, default_branch)
+    if collisions:
+        logger.info("Aider: resolved %d Next.js route collision file(s) for issue #%d", collisions, issue_number)
+
+    # Catch Aider's whole-edit parser misreads: when the issue body contains
+    # setup instructions like `npm install` or `SUPABASE_*=value` in code blocks,
+    # Aider writes them as files in the repo root. Reviewer flagged these
+    # as "spurious files committed to repository root" — this is the structural
+    # fix.
+    bogus = await _remove_bogus_root_files(repo_dir, default_branch)
+    if bogus:
+        logger.info("Aider: removed %d bogus root file(s) from parser misread for issue #%d", bogus, issue_number)
+
     # Fill any files that Aider missed due to output-token limit (whole-mode truncation).
     # Two sources of "missing": (a) files declared in the issue body's file_paths, and
     # (b) files Aider touched in the commit but left empty / unparseable.
@@ -792,14 +1126,43 @@ async def _implement_issue_locked(
         fix_task = (
             f"The code you just wrote has a build error. Fix it.\n\n"
             f"Build error:\n```\n{build_output[-3000:]}\n```\n\n"
-            f"Fix only what is broken. Do not rewrite files that are working."
+            f"Fix only what is broken. Do not rewrite files that are working.\n\n"
+            f"IMPORTANT — DO NOT create new files in response to error messages that mention "
+            f"file paths. Error messages list the paths of files that ALREADY EXIST and are "
+            f"broken. Edit the existing file; do not create a new one at the path mentioned.\n\n"
+            f"If the error says 'parallel pages' or 'cannot have two pages that resolve to the "
+            f"same path', the fix is to DELETE one of the two files (not create a third). "
+            f"The orchestrator will auto-resolve route collisions, so just leave duplicates "
+            f"alone if you see them — fix the underlying type/import/syntax error instead."
         )
+        # Extract any file paths mentioned in the build error and pass them as
+        # --file args. Without this, Aider's diff format has no files in context
+        # and the retry resorts to .gitignore housekeeping (the LLM produces
+        # text but has nowhere to write a patch).
+        error_file_paths = _extract_file_paths(build_output)
+        if error_file_paths:
+            logger.info(
+                "Aider: build error mentioned %d file(s) — adding to retry context: %s",
+                len(error_file_paths), error_file_paths,
+            )
         fix_args = [
             "--model", model, "--message", fix_task,
             "--yes", "--no-pretty", "--no-check-update", "--no-show-model-warnings",
             "--edit-format", "diff",
             "--map-tokens", "4096", "--git", "--auto-commits",
+            "--cache-prompts",  # same caching as main run — see comment above
         ]
+        # Always re-pass the original spec's --file targets so Aider has its
+        # working set. Augment with files named in the build error.
+        retry_files: list[str] = []
+        for fp in file_paths:
+            if (repo_dir / fp).exists() and fp not in retry_files:
+                retry_files.append(fp)
+        for fp in error_file_paths:
+            if (repo_dir / fp).exists() and fp not in retry_files:
+                retry_files.append(fp)
+        for fp in retry_files:
+            fix_args.extend(["--file", fp])
         if shutil.which("aider"):
             fix_cmd = ["aider", *fix_args]
         elif shutil.which("uvx"):
@@ -809,6 +1172,37 @@ async def _implement_issue_locked(
 
         _, fix_out = await _run_aider(fix_cmd, cwd=repo_dir, env=env)
         logger.info("Aider fix run output:\n%s", redact(fix_out[-2000:]))
+
+        # Re-run the post-Aider sanitisers between retry and second build check.
+        # Without this, an Aider retry that misinterprets a route-collision
+        # error as "missing file" (and creates the wrong-side duplicate) sails
+        # straight to the build check with the same collision intact —
+        # producing the "needs human help" blocker even though the structural
+        # fix is automatic.
+        retry_path_fixes = await _fix_nextjs_page_paths(repo_dir, default_branch)
+        if retry_path_fixes:
+            logger.info(
+                "Aider: post-retry path-fix moved %d misplaced page file(s) for issue #%d",
+                retry_path_fixes, issue_number,
+            )
+        retry_enforced = await _enforce_aider_deletions(repo_dir, default_branch)
+        if retry_enforced:
+            logger.info(
+                "Aider: post-retry enforced %d deletion(s) for issue #%d",
+                retry_enforced, issue_number,
+            )
+        retry_collisions = await _resolve_route_collisions(repo_dir, default_branch)
+        if retry_collisions:
+            logger.info(
+                "Aider: post-retry resolved %d route collision file(s) for issue #%d",
+                retry_collisions, issue_number,
+            )
+        retry_bogus = await _remove_bogus_root_files(repo_dir, default_branch)
+        if retry_bogus:
+            logger.info(
+                "Aider: post-retry removed %d bogus root file(s) for issue #%d",
+                retry_bogus, issue_number,
+            )
 
         build_passed2, build_output2 = await run_build_in_docker(repo_dir)
         if not build_passed2:

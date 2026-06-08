@@ -70,6 +70,7 @@ export default function ProjectPage() {
   const [reviewingIssues, setReviewingIssues] = useState<Set<number>>(new Set());
   const [assigningIssues, setAssigningIssues] = useState<Set<number>>(new Set());
   const [implementingIssues, setImplementingIssues] = useState<Set<number>>(new Set());
+  const [previewingIssues, setPreviewingIssues] = useState<Set<number>>(new Set());
   const [isCreatingIssue, setIsCreatingIssue] = useState(false);
   const [isCheckingBuild, setIsCheckingBuild] = useState(false);
   const [llmConfig, setLlmConfig] = useState<ProjectLlmConfig>(
@@ -128,6 +129,7 @@ export default function ProjectPage() {
     triggerPRReview,
     assignIssueToCopilot,
     implementWithAider,
+    previewIssueBranch,
     createIssueFromPrompt,
     updateDeployTarget,
     updateProjectLlmConfig,
@@ -284,6 +286,23 @@ export default function ProjectPage() {
         next.delete(issueNumber);
         return next;
       });
+    }
+  };
+
+  const handlePreviewBranch = async (issueNumber: number) => {
+    setPreviewingIssues((prev) => new Set(prev).add(issueNumber));
+    try {
+      await previewIssueBranch(projectId, issueNumber);
+    } finally {
+      // Clear after a short window — the orchestrator emits status:update with
+      // the preview_url when the build finishes, but we don't wait synchronously.
+      setTimeout(() => {
+        setPreviewingIssues((prev) => {
+          const next = new Set(prev);
+          next.delete(issueNumber);
+          return next;
+        });
+      }, 60_000);
     }
   };
 
@@ -633,63 +652,98 @@ export default function ProjectPage() {
 
               <div className="mt-4 space-y-4">
                 {(["architect", "builder", "reviewer"] as const).map((role) => (
-                  <div key={role} className="grid gap-3 md:grid-cols-[96px_1fr_1.2fr]">
-                    <div className="self-center text-sm font-medium capitalize">{role}</div>
+                  <div key={role} className="space-y-2">
+                    <div className="grid gap-3 md:grid-cols-[96px_1fr_1.2fr]">
+                      <div className="self-center text-sm font-medium capitalize">{role}</div>
 
-                    <label className="space-y-1 text-sm">
-                      <span className="text-muted-foreground">Provider</span>
-                      <select
-                        value={llmConfig[role].provider}
-                        disabled={isRunning}
-                        onChange={(event) => {
-                          const provider = event.target.value as LlmProvider;
-                          void updateRoleProvider(role, provider);
-                        }}
+                      <label className="space-y-1 text-sm">
+                        <span className="text-muted-foreground">Provider</span>
+                        <select
+                          value={llmConfig[role].provider}
+                          disabled={isRunning}
+                          onChange={(event) => {
+                            const provider = event.target.value as LlmProvider;
+                            void updateRoleProvider(role, provider);
+                          }}
+                          className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+                        >
+                          {llmProviders.map((provider) => (
+                            <option key={provider.value} value={provider.value}>
+                              {provider.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label className="space-y-1 text-sm">
+                        <span className="text-muted-foreground">Model</span>
+                        <select
+                          value={llmConfig[role].model}
+                          disabled={isRunning}
+                          onChange={(event) =>
+                            setLlmConfig((current) => ({
+                              ...current,
+                              [role]: {
+                                ...current[role],
+                              model: event.target.value,
+                            },
+                          }))
+                        }
                         className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
                       >
-                        {llmProviders.map((provider) => (
-                          <option key={provider.value} value={provider.value}>
-                            {provider.label}
+                          <option value="">
+                            {loadingProviders[llmConfig[role].provider]
+                              ? "Loading models..."
+                              : modelOptionsFor(llmConfig[role].provider).length > 0
+                              ? "Select model"
+                              : "No models available"}
                           </option>
-                        ))}
-                      </select>
-                    </label>
+                          {modelOptionsFor(llmConfig[role].provider).map((model) => (
+                            <option key={model.id} value={model.id}>
+                              {model.label}
+                            </option>
+                          ))}
+                        </select>
+                        {providerCatalogs[llmConfig[role].provider]?.error && (
+                          <p className="text-xs text-amber-500">
+                            {providerCatalogs[llmConfig[role].provider]?.error}
+                          </p>
+                        )}
+                      </label>
+                    </div>
 
-                    <label className="space-y-1 text-sm">
-                      <span className="text-muted-foreground">Model</span>
-                      <select
-                        value={llmConfig[role].model}
-                        disabled={isRunning}
-                        onChange={(event) =>
-                          setLlmConfig((current) => ({
-                            ...current,
-                            [role]: {
-                              ...current[role],
-                            model: event.target.value,
-                          },
-                        }))
-                      }
-                      className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
-                    >
-                        <option value="">
-                          {loadingProviders[llmConfig[role].provider]
-                            ? "Loading models..."
-                            : modelOptionsFor(llmConfig[role].provider).length > 0
-                            ? "Select model"
-                            : "No models available"}
-                        </option>
-                        {modelOptionsFor(llmConfig[role].provider).map((model) => (
-                          <option key={model.id} value={model.id}>
-                            {model.label}
-                          </option>
-                        ))}
-                      </select>
-                      {providerCatalogs[llmConfig[role].provider]?.error && (
-                        <p className="text-xs text-amber-500">
-                          {providerCatalogs[llmConfig[role].provider]?.error}
-                        </p>
-                      )}
-                    </label>
+                    {role === "builder" && (
+                      <div className="grid gap-3 md:grid-cols-[96px_1fr_1.2fr]">
+                        <div />
+                        <label className="space-y-1 text-sm md:col-span-2">
+                          <span className="text-muted-foreground">Engine</span>
+                          <select
+                            value={llmConfig.builder.engine ?? "aider"}
+                            disabled={isRunning}
+                            onChange={(event) =>
+                              setLlmConfig((current) => ({
+                                ...current,
+                                builder: {
+                                  ...current.builder,
+                                  engine: event.target.value as "aider" | "agent_sdk",
+                                },
+                              }))
+                            }
+                            className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
+                          >
+                            <option value="aider">Aider (subprocess, default)</option>
+                            <option value="agent_sdk">
+                              Agent SDK (Anthropic tool-loop — experimental, ~5× cheaper)
+                            </option>
+                          </select>
+                          <p className="text-xs text-muted-foreground">
+                            Anthropic Agent SDK uses prompt caching and tool-use for
+                            cheaper, cleaner runs. Push goes to <code>agent-sdk/fix-N</code>{" "}
+                            instead of <code>aider/fix-N</code>. Anthropic models only.
+                          </p>
+                        </label>
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -903,11 +957,13 @@ export default function ProjectPage() {
               onReview={(issueNumber, prNumber) => void handleReviewPR(issueNumber, prNumber)}
               onAssignCopilot={(issueNumber) => void handleAssignCopilot(issueNumber)}
               onImplementAider={(issueNumber) => void handleImplementAider(issueNumber)}
+              onPreviewBranch={(issueNumber) => void handlePreviewBranch(issueNumber)}
               onCreateIssue={(prompt) => void handleCreateIssue(prompt)}
               onBuildCheck={() => void handleBuildCheck()}
               reviewingIssues={reviewingIssues}
               assigningIssues={assigningIssues}
               implementingIssues={implementingIssues}
+              previewingIssues={previewingIssues}
               isSyncing={isSyncingIssues}
               isAuditing={isAuditing}
               isCreatingIssue={isCreatingIssue}

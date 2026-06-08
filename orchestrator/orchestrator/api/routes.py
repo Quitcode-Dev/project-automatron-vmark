@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import uuid
 from typing import Any, Literal
 
 import io
 import json
 import zipfile
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from pydantic import BaseModel, Field
@@ -59,9 +62,15 @@ class RoleLlmConfig(BaseModel):
     model: str
 
 
+class BuilderRoleLlmConfig(RoleLlmConfig):
+    # "aider" (default) or "agent_sdk". normalize_llm_config falls back to
+    # the default if missing or invalid, so this is permissive on input.
+    engine: str | None = None
+
+
 class ProjectLlmConfigRequest(BaseModel):
     architect: RoleLlmConfig
-    builder: RoleLlmConfig
+    builder: BuilderRoleLlmConfig
     reviewer: RoleLlmConfig
 
 
@@ -373,6 +382,27 @@ async def api_implement_aider(
     return {"status": "started", "issue_number": str(issue_number)}
 
 
+class ReimplementWithContextRequest(BaseModel):
+    context: str = Field(..., description="The error context to feed back to Aider")
+
+
+@router.post("/projects/{project_id}/issues/{issue_number}/reimplement-with-context")
+async def api_reimplement_with_context(
+    project_id: str, issue_number: int,
+    req: ReimplementWithContextRequest, background_tasks: BackgroundTasks,
+) -> dict[str, str]:
+    """Re-run Aider on an existing issue with extra context appended to the spec.
+
+    Used by the "Send to Aider" button on ERROR-level activity rows: the row's
+    title + body + error_detail is bundled and fed back as a fix directive.
+    """
+    await _get_required_project(project_id)
+    background_tasks.add_task(
+        orch_implement_aider, project_id, issue_number, req.context,
+    )
+    return {"status": "started", "issue_number": str(issue_number)}
+
+
 class CreateIssueFromPromptRequest(BaseModel):
     prompt: str
 
@@ -537,12 +567,44 @@ async def api_restart_preview(project_id: str, background_tasks: BackgroundTasks
     return {"status": "started", "project_id": project_id}
 
 
-async def _run_preview_and_save(project_id: str, owner: str, repo: str, default_branch: str = "main") -> None:
+async def _run_preview_and_save(
+    project_id: str, owner: str, repo: str, default_branch: str = "main",
+    branch: str | None = None, issue_number: int | None = None,
+) -> None:
     from orchestrator.preview import run_preview_locally
     from orchestrator.api.websocket import emit_status_update, emit_error
-    preview_url = await run_preview_locally(project_id, owner, repo, default_branch)
+    from orchestrator.models.project import save_activity_log, get_activity_logs
+
+    # FastAPI swallows exceptions from BackgroundTasks. Without this wrapper a
+    # crash anywhere in run_preview_locally (e.g. AttributeError before the
+    # first emit_error path) would leave the user staring at a silent UI. Always
+    # surface SOMETHING.
+    try:
+        preview_url = await run_preview_locally(
+            project_id, owner, repo, default_branch, branch=branch, issue_number=issue_number,
+        )
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        logger.exception("Preview: unhandled exception in run_preview_locally")
+        try:
+            existing = await get_activity_logs(project_id)
+            seq = max((r.get("seq", 0) for r in existing), default=0) + 1
+            await save_activity_log(
+                project_id, seq, "Preview: CRASHED",
+                f"Unhandled exception: {exc!r}\n\n{tb[-2000:]}", "ERROR",
+            )
+        except Exception:
+            logger.exception("Preview: also failed to write crash log to activity_logs")
+        await emit_error(
+            project_id,
+            f"Preview crashed with an unhandled exception: `{exc!r}`. See activity log for the traceback.",
+        )
+        return
+
     if not preview_url:
-        await emit_error(project_id, "Preview build failed — check that the repo builds successfully")
+        # run_preview_locally already emits a specific emit_error + activity_log
+        # entry on the known failure paths.
         return
     await update_project_preview(project_id, preview_url, "ready")
     project = await get_project(project_id)
@@ -554,6 +616,28 @@ async def _run_preview_and_save(project_id: str, owner: str, repo: str, default_
             progress={},
             preview_url=preview_url,
         )
+
+
+@router.post("/projects/{project_id}/issues/{issue_number}/preview")
+async def api_preview_issue_branch(
+    project_id: str, issue_number: int, background_tasks: BackgroundTasks,
+) -> dict[str, str]:
+    """Spin up a preview against the Aider PR branch for this issue, so the user
+    can see the implementation before merging."""
+    project = await _get_required_project(project_id)
+    owner = project.get("github_repo_owner") or ""
+    repo = project.get("github_repo_name") or ""
+    if not owner or not repo:
+        raise HTTPException(status_code=422, detail="Project has no GitHub repo configured")
+    default_branch = project.get("default_branch") or "main"
+    # The Aider workflow always pushes to branch `aider/fix-<issue_number>`. We
+    # don't bother resolving via the PR number because the branch naming is
+    # deterministic — and the issue may not even have a PR recorded yet locally.
+    branch = f"aider/fix-{issue_number}"
+    background_tasks.add_task(
+        _run_preview_and_save, project_id, owner, repo, default_branch, branch, issue_number,
+    )
+    return {"status": "started", "project_id": project_id, "branch": branch}
 
 
 def _raise_for_preflight_failure(result: PreflightResult) -> None:

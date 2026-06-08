@@ -32,13 +32,21 @@ class Settings(BaseSettings):
     git_author_email: str = "automatron@example.local"
 
     # --- Architect ---
-    architect_model: str = "gpt-5.3-codex"
+    # Architect benefits most from a larger model — planning quality drives
+    # every downstream issue, so the marginal cost is worth it.
+    architect_model: str = "anthropic/claude-opus-4-6"
     architect_prompt_version: str = "v1"
 
     # --- Builder ---
-    builder_model: str = "gpt-5.3-codex"
+    # Defaults to Sonnet (~5× cheaper than Opus) because Aider's diff-format
+    # quality on Sonnet is nearly indistinguishable for the patch-style edits
+    # Aider does. Override per-project via llm_config if a task truly needs
+    # Opus-level reasoning.
+    builder_model: str = "anthropic/claude-sonnet-4-6"
     builder_cline_timeout: int = 900
-    reviewer_model: str = "gpt-5.3-codex"
+    # Reviewer reads PR diffs and emits a short structured summary — Sonnet
+    # is more than enough.
+    reviewer_model: str = "anthropic/claude-sonnet-4-6"
 
     # --- Docker ---
     golden_image: str = "automatron/golden:latest"
