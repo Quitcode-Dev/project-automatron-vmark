@@ -58,6 +58,31 @@ class Settings(BaseSettings):
     deploy_ssh_key_path: str = ""
     deploy_ssh_options: str = ""
 
+    # --- Docker AI / Deployment Intelligence ---
+    # Provider priority chain (comma-separated, order matters). First available wins.
+    # Allowed tokens: gordon, docker_agent, model_runner, litellm
+    docker_ai_provider_priority: str = "gordon,docker_agent,model_runner,litellm"
+    # When true, fail loudly if Gordon (`docker ai`) is unavailable instead of
+    # falling through the chain. Use this on workstations where Docker Desktop is
+    # required; leave false in containerized deployments where Gordon is usually
+    # not present.
+    docker_ai_require_gordon: bool = False
+    docker_ai_enable_agent: bool = True
+    docker_ai_enable_mcp: bool = True
+    docker_ai_enable_model_runner: bool = False
+    docker_model_runner_base_url: str = "http://model-runner.docker.internal:12434"
+    docker_model_gateway_base_url: str = "http://localhost:12434"
+    # Subprocess hard limits for docker ai / cagent invocations. Keeps a stuck
+    # LLM call from blocking the event loop indefinitely or filling memory.
+    docker_ai_timeout_seconds: int = 120
+    docker_ai_max_output_bytes: int = 262144
+    # Model for the DevOps/deployment agent. Passed to docker ai / cagent /
+    # model runner when the backend supports a `--model` flag, and used directly
+    # by the litellm fallback (the production path inside the Linux container,
+    # where Gordon is unavailable). Codex rejects non-default temperature — the
+    # llm provider sets temperature=1 for any `gpt-5*` model.
+    docker_ai_model: str = "gpt-5.3-codex"
+
     # --- Database ---
     sqlite_db_path: str = "./data/automatron.db"
     checkpoint_db_path: str = "./data/checkpoints.db"

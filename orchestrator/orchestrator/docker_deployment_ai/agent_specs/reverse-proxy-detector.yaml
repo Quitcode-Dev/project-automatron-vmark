@@ -1,0 +1,100 @@
+# Docker Agent spec: reverse-proxy-detector
+# Responsibility: analyze Docker containers, labels, networks, ports, system
+# services, and host listening ports to classify existing routing infrastructure.
+#
+# Output classifications:
+#   none | plain_docker | docker_compose | traefik | kamal_v1 | kamal_v2
+#   | nginx | caddy | mixed | unknown
+
+name: reverse-proxy-detector
+version: "1.0"
+description: >
+  Classify the reverse proxy and deployment manager on a remote host from
+  sanitized inventory data. Must detect Traefik, Kamal v1 (Traefik-based),
+  Kamal v2 (kamal-proxy), Nginx, Caddy, plain Docker Compose, mixed
+  setups, and unknown configurations.
+
+model: docker/docker-model-runner-llama3.2
+
+role: |
+  You are a Docker infrastructure analyst. Your sole task is to classify
+  the reverse proxy and deployment manager on a server from inventory data.
+  Be conservative: when evidence is conflicting or insufficient, classify
+  as mixed or unknown rather than guessing. Provide clear evidence for
+  each classification.
+
+toolsets:
+  - docker:inspect
+
+input_schema:
+  type: object
+  required:
+    - containers
+    - listening_ports
+  properties:
+    containers:
+      type: array
+      description: List of container objects with name, image, labels, ports
+    listening_ports:
+      type: array
+      description: List of {port, proto, process} objects
+    service_status:
+      type: object
+      description: Systemd service active/inactive status for known proxies
+    networks:
+      type: array
+      description: Docker network list
+
+output_schema:
+  type: object
+  required:
+    - deployment_manager
+    - reverse_proxy
+    - confidence
+    - evidence
+  properties:
+    deployment_manager:
+      type: string
+      enum: [none, plain_docker, docker_compose, traefik, kamal_v1, kamal_v2, nginx, caddy, mixed, unknown]
+    reverse_proxy:
+      type: string
+      enum: [none, traefik, kamal_proxy, nginx, caddy, unknown]
+    confidence:
+      type: number
+      minimum: 0.0
+      maximum: 1.0
+    evidence:
+      type: array
+      items:
+        type: string
+    traefik_routes:
+      type: array
+      items:
+        type: string
+      description: Detected Traefik Host() routing rules
+    kamal_networks:
+      type: array
+      items:
+        type: string
+      description: Kamal-managed Docker network names
+
+detection_rules:
+  traefik:
+    - Container name or image contains 'traefik'
+    - Any container label starts with 'traefik.enable', 'traefik.http.routers.', etc.
+    - Port 80 or 443 is owned by a container matching the above
+  kamal_v1:
+    - Traefik detected AND Kamal-style app containers present (name matches <app>-<role>-<hex>)
+    - deploy.yml has a top-level 'traefik:' block
+  kamal_v2:
+    - Container named or imaged 'kamal-proxy'
+    - kamal-proxy owns ports 80 and/or 443
+    - deploy.yml has a top-level 'proxy:' block (not 'traefik:')
+  nginx:
+    - Container named or imaged 'nginx', OR nginx systemd service active, OR nginx in ps
+  caddy:
+    - Container named or imaged 'caddy', OR caddy systemd service active, OR caddy in ps
+  mixed:
+    - Multiple proxy types detected simultaneously
+  unknown:
+    - Some evidence of proxy but insufficient to classify

@@ -1,0 +1,84 @@
+# Docker Agent spec: deployment-reviewer
+# Responsibility: review the final deployment plan, Compose file, Dockerfile,
+# routing labels, healthchecks, rollback metadata, and risk flags before
+# execution is allowed.
+
+name: deployment-reviewer
+version: "1.0"
+description: >
+  Perform a pre-execution review of a complete deployment plan. Identifies
+  safety issues, missing healthchecks, routing conflicts, and rollback gaps.
+  Output is advisory — the DeterministicValidator in Automatron has final say.
+
+model: docker/docker-model-runner-llama3.2
+
+role: |
+  You are a Docker deployment safety reviewer. You examine deployment plans
+  and identify issues before they cause production incidents. You are
+  conservative: flag anything that could cause data loss, service disruption,
+  or conflict with existing infrastructure. You do not approve or reject
+  deployments — that is Automatron's job. You provide findings.
+
+toolsets:
+  - filesystem:read
+
+input_schema:
+  type: object
+  required:
+    - plan_json
+  properties:
+    plan_json:
+      type: object
+      description: The full deployment_plan.json to review
+    compose_content:
+      type: string
+      description: Generated or existing docker-compose.yml
+    dockerfile_content:
+      type: string
+      description: Dockerfile to review, if available
+    inventory_summary:
+      type: object
+      description: Sanitized inventory summary for context
+
+output_schema:
+  type: object
+  required:
+    - status
+    - issues
+    - warnings
+  properties:
+    status:
+      type: string
+      enum: [passed, issues_found, blocked]
+    issues:
+      type: array
+      items:
+        type: object
+        properties:
+          severity:
+            type: string
+            enum: [error, warning, info]
+          category:
+            type: string
+          description:
+            type: string
+    warnings:
+      type: array
+      items:
+        type: string
+    suggested_fixes:
+      type: array
+      items:
+        type: string
+
+review_checklist:
+  - Healthcheck is defined and reachable
+  - Rollback metadata is populated before any destructive action
+  - No second reverse proxy installation when 80/443 are owned
+  - Domain is not already routed to another service
+  - No container name conflicts with existing containers
+  - No unsafe volume overwrites (same name, different app)
+  - No Docker network conflicts
+  - Required secrets are declared (not values, just names)
+  - compose syntax appears valid
+  - Dockerfile base image is not :latest for production

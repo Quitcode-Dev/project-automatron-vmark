@@ -11,6 +11,7 @@ from typing import Any
 import aiosqlite
 
 from orchestrator.config import settings
+from orchestrator.docker_deployment_ai.schema import init_deployment_schema
 from orchestrator.llm.configuration import default_llm_config, normalize_llm_config
 
 logger = logging.getLogger(__name__)
@@ -375,6 +376,7 @@ async def init_db(db_path: str) -> None:
             "build_status": "TEXT",
             "implementing_started_at": "TEXT",
         })
+        await init_deployment_schema(db)
         await db.commit()
         logger.info("Database initialized: %s", db_path)
 
