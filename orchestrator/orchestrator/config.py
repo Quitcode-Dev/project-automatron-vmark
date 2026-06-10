@@ -76,9 +76,12 @@ class Settings(BaseSettings):
     # LLM call from blocking the event loop indefinitely or filling memory.
     docker_ai_timeout_seconds: int = 120
     docker_ai_max_output_bytes: int = 262144
-    # Optional model override passed through to docker ai / cagent / model runner
-    # when the backend supports a `--model` flag. Empty = backend default.
-    docker_ai_model: str = ""
+    # Model for the DevOps/deployment agent. Passed to docker ai / cagent /
+    # model runner when the backend supports a `--model` flag, and used directly
+    # by the litellm fallback (the production path inside the Linux container,
+    # where Gordon is unavailable). Codex rejects non-default temperature — the
+    # llm provider sets temperature=1 for any `gpt-5*` model.
+    docker_ai_model: str = "gpt-5.3-codex"
 
     # --- Database ---
     sqlite_db_path: str = "./data/automatron.db"
