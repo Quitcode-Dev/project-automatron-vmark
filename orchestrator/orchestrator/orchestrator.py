@@ -978,8 +978,27 @@ class GitHubOrchestrator:
                     content,
                     re.MULTILINE,
                 )
-                if sig_lines:
-                    sigs_by_file[cand] = "\n".join(s.strip() for s in sig_lines[:15])
+                # ALSO extract cva variant keys when the file uses class-variance-authority.
+                # Without this, a Badge / Button component that defines a `success` variant
+                # is invisible to the reviewer — the regex above only catches the wrapping
+                # interface, not the variant strings inside cva(). The reviewer then falls
+                # back to "standard shadcn has 4 variants" priors and flags valid usage as
+                # a build error. (Real false-positive observed on PR #111, issue #69.)
+                variant_lines: list[str] = []
+                cva_match = re.search(
+                    r'cva\s*\([^,]+,\s*\{\s*variants\s*:\s*\{\s*variant\s*:\s*\{([^}]+)\}',
+                    content,
+                    re.DOTALL,
+                )
+                if cva_match:
+                    keys = re.findall(r'(\w+)\s*:', cva_match.group(1))
+                    if keys:
+                        variant_lines.append(
+                            f"// cva variant keys available: {', '.join(keys)}"
+                        )
+                combined_lines = [*(s.strip() for s in sig_lines[:15]), *variant_lines]
+                if combined_lines:
+                    sigs_by_file[cand] = "\n".join(combined_lines)
                 break
 
         if not sigs_by_file:
@@ -1057,6 +1076,14 @@ class GitHubOrchestrator:
             "- **Speculative concerns** (\"may complain\", \"could fail\", \"potentially\", "
             "\"depending on version\", \"if X is not typed as Y…\"). Either verify the concern using "
             "the imported signatures and stack files OR omit it. Unverified hedged concerns are noise.\n"
+            "- **Component variant claims you can't verify.** When the diff uses something like "
+            "`variant=\"success\"` on a UI component (Badge, Button, Alert, etc.), DO NOT flag it as "
+            "an invalid variant unless the imported file's signatures explicitly contradict it. "
+            "Look for a `// cva variant keys available: ...` comment in the imported signatures — "
+            "that's the canonical list. If `success` is listed, the usage is valid. If no variant "
+            "list is shown (e.g. the component doesn't use cva, or the variants couldn't be parsed), "
+            "DO NOT assert what the variants are from prior knowledge of shadcn/MUI/etc. — omit the "
+            "concern. Standard-library variant priors are NOT a verification source.\n"
             "- **Additive code that doesn't break anything** (extra test cases, extra exports the "
             "spec didn't ask for). Note them under \"What was done well\" if worth mentioning.\n"
             "- **Stylistic preferences** unless they violate stated implementation_notes.\n\n"
