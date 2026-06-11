@@ -690,6 +690,7 @@ async def implement_issue(
     default_branch: str = "main",
     model: str = "anthropic/claude-sonnet-4-6",
     is_reimplementation: bool = False,
+    supabase_schema_markdown: str | None = None,
 ) -> tuple[str | None, str | None]:
     """Lock-wrapped entrypoint. Serialises all Aider runs for one project."""
     lock = await _get_workspace_lock(project_id)
@@ -701,7 +702,7 @@ async def implement_issue(
     async with lock:
         return await _implement_issue_locked(
             project_id, owner, repo, issue_number, issue_title, issue_body,
-            default_branch, model, is_reimplementation,
+            default_branch, model, is_reimplementation, supabase_schema_markdown,
         )
 
 
@@ -715,6 +716,7 @@ async def _implement_issue_locked(
     default_branch: str = "main",
     model: str = "anthropic/claude-sonnet-4-6",
     is_reimplementation: bool = False,
+    supabase_schema_markdown: str | None = None,
 ) -> tuple[str | None, str | None]:
     """
     Clone/pull the repo, run Aider on the issue, push a branch.
@@ -885,6 +887,19 @@ async def _implement_issue_locked(
         else ""
     )
 
+    schema_block = ""
+    if supabase_schema_markdown:
+        schema_block = (
+            "\n\n## Database schema — DO NOT INVENT TABLES OR COLUMNS\n\n"
+            f"{supabase_schema_markdown}\n\n"
+            "If your implementation needs a table or column not listed above, STOP. "
+            "Write a TODO comment naming the missing field instead of writing code that "
+            "references a fictional column — the build will fail at `npm run build` if "
+            "you reference columns that aren't in `database.types.ts`. Use "
+            "`Database[\"public\"][\"Tables\"][\"<table>\"][\"Row\"]` types when "
+            "defining shapes, so TypeScript catches typos at compile time.\n"
+        )
+
     task = (
         f"# Task: {issue_title}\n\n"
         f"{issue_body}\n\n"
@@ -902,6 +917,7 @@ async def _implement_issue_locked(
         f"(`Dockerfile`, `Makefile`, `LICENSE`, `README`). If you see a line like "
         f"`npm run build` or `KEY=value` preceding a code block, treat it as the "
         f"START of a command/env example, NOT a filename."
+        f"{schema_block}"
     )
 
     env = {**os.environ}

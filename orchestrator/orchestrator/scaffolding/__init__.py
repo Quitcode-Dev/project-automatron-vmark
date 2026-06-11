@@ -38,11 +38,18 @@ async def maybe_scaffold_repo(
     intake_text: str,
     readme: str,
     log_fn: Any | None = None,
+    database_types_ts: str | None = None,
 ) -> str | None:
     """Detect framework and scaffold the repo if needed.
 
     Returns the framework key actually scaffolded, or None if scaffolding was
     skipped (repo already has package.json, framework not detected, etc.).
+
+    `database_types_ts`, when provided, replaces the fixture stub
+    `src/lib/supabase/database.types.ts` with real generated types from the
+    live Supabase schema. This is the compile-time safety net — once written,
+    `npm run build` will reject `donor.assigned_solicitor_id` if that column
+    isn't on the live `donors` table.
 
     `log_fn` is an optional async callable matching `Orchestrator._log` so we
     can surface progress in the activity tab.
@@ -67,7 +74,7 @@ async def maybe_scaffold_repo(
 
     if framework == "nextjs":
         from orchestrator.scaffolding.nextjs import scaffold_nextjs
-        await scaffold_nextjs(gh, owner, repo, log_fn=log_fn)
+        await scaffold_nextjs(gh, owner, repo, log_fn=log_fn, database_types_ts=database_types_ts)
         return "nextjs"
 
     return None

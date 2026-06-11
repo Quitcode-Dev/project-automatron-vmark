@@ -15,6 +15,10 @@ You are the post-build feedback classifier for an autonomous coding system. The 
 ## Live database schema (treat as source of truth over migrations)
 {schema_context}
 
+## Schema discipline (mandatory)
+
+When emitting issues, every column or table you mention in `description`, `implementation_notes`, or `file` MUST appear in the live schema above. Do not pluralize, abbreviate, or guess — names match exactly. If the live schema section shows a "schema introspection failed" message, do NOT propose tasks that touch database tables; instead emit `kind: "clarify"` and ask the user to fix Supabase credentials first. If the feedback requires a column that doesn't exist in the live schema, emit a single issue titled exactly `User action required: add column X to table Y in Supabase` and stop — do not silently invent the column in another task. Pre-existing migration files in the repo (`supabase/migrations/*.sql`) that disagree with the live schema are stale; do not reference their names.
+
 ## Classification rules
 
 Pick exactly one `kind`:

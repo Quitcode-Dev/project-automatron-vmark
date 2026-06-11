@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -152,11 +153,183 @@ async def _fetch_figma_context(urls: list[str], token: str) -> str:
     return "\n\n".join(parts)
 
 
-async def _introspect_supabase_schema(supabase_url: str, service_role_key: str) -> str:
-    """Query PostgREST's OpenAPI endpoint to list every table and column in the public schema.
+@dataclass
+class SupabaseSchema:
+    """Structured result of introspecting a live Supabase project.
 
-    Returns a markdown-formatted summary suitable for injection into the architect's prompt.
-    The architect should treat this as authoritative over any migration files in the repo.
+    Used to feed three downstream consumers from one introspection call:
+      - markdown    → architect + builder prompt injection
+      - typescript  → scaffolded src/lib/supabase/database.types.ts
+      - tables/table_kinds → programmatic schema-violation check in review_pr
+
+    `ok=False` means the introspection itself failed (network / 4xx / 5xx /
+    empty definitions). Callers MUST check `ok` before injecting `markdown`
+    into a prompt — silently passing an error string into the architect was
+    the original bug that let it invent a fictional schema.
+    """
+    ok: bool
+    error: str | None = None
+    markdown: str = ""
+    typescript: str = ""
+    tables: dict[str, list[str]] = field(default_factory=dict)
+    table_kinds: dict[str, str] = field(default_factory=dict)  # name → "table" | "view"
+    # Insert/Update column sets per table (excludes readOnly columns).
+    writable_cols: dict[str, list[str]] = field(default_factory=dict)
+    # Nullable column set per table (subset of Row cols not in `required`).
+    nullable_cols: dict[str, set[str]] = field(default_factory=dict)
+
+
+_TS_PRIMITIVE = {
+    "string": "string",
+    "integer": "number",
+    "number": "number",
+    "boolean": "boolean",
+    "array": "unknown[]",
+    "object": "Record<string, unknown>",
+}
+
+
+def _ts_type_for_column(col: dict[str, Any]) -> str:
+    """Map a PostgREST OpenAPI column descriptor to a TypeScript type literal."""
+    fmt = (col.get("format") or "").lower()
+    typ = (col.get("type") or "").lower()
+    if fmt in ("text", "character varying", "uuid", "date", "timestamp", "timestamptz",
+               "timestamp with time zone", "timestamp without time zone", "time", "bytea"):
+        return "string"
+    if fmt in ("smallint", "integer", "bigint", "numeric", "real",
+               "double precision", "int2", "int4", "int8", "float4", "float8"):
+        return "number"
+    if fmt == "boolean":
+        return "boolean"
+    if fmt == "json" or fmt == "jsonb":
+        return "Json"
+    return _TS_PRIMITIVE.get(typ, "unknown")
+
+
+def _build_typescript_types(
+    definitions: dict[str, Any],
+    table_kinds: dict[str, str],
+) -> str:
+    """Generate src/lib/supabase/database.types.ts content matching Supabase's
+    `gen types typescript` output shape (Tables/Views/Row/Insert/Update).
+
+    Views and definitions of uncertain kind get `Record<string, unknown>` rather
+    than risk wrong row shapes. readOnly columns appear in Row but are omitted
+    from Insert/Update — emitting them there would break runtime inserts on
+    generated columns.
+    """
+    out: list[str] = []
+    out.append("// Auto-generated from the live Supabase project's PostgREST OpenAPI.")
+    out.append("// This file is the source of truth for table/column names — do not edit by hand.")
+    out.append("// Regenerated on every project scaffold; runtime introspection refreshes it.")
+    out.append("")
+    out.append("export type Json =")
+    out.append("  | string")
+    out.append("  | number")
+    out.append("  | boolean")
+    out.append("  | null")
+    out.append("  | { [key: string]: Json | undefined }")
+    out.append("  | Json[];")
+    out.append("")
+    out.append("export type Database = {")
+    out.append("  public: {")
+    out.append("    Tables: {")
+
+    table_names = [n for n, k in sorted(table_kinds.items()) if k == "table"]
+    view_names = [n for n, k in sorted(table_kinds.items()) if k == "view"]
+
+    def _emit_row(name: str, props: dict[str, Any], required: set[str]) -> list[str]:
+        block: list[str] = []
+        for col_name in sorted(props.keys()):
+            col = props[col_name]
+            ts = _ts_type_for_column(col)
+            nullable = col_name not in required
+            block.append(f"          {col_name}: {ts}{' | null' if nullable else ''};")
+        return block
+
+    for name in table_names:
+        table = definitions.get(name, {})
+        props = table.get("properties", {}) or {}
+        required = set(table.get("required", []) or [])
+        out.append(f"      {name}: {{")
+        out.append("        Row: {")
+        out.extend(_emit_row(name, props, required))
+        out.append("        };")
+        # Insert: required cols are mandatory, readOnly cols are excluded
+        out.append("        Insert: {")
+        for col_name in sorted(props.keys()):
+            col = props[col_name]
+            if col.get("readOnly") is True:
+                continue
+            ts = _ts_type_for_column(col)
+            optional = col_name not in required or col.get("default") is not None
+            nullable = col_name not in required
+            out.append(
+                f"          {col_name}{'?' if optional else ''}: {ts}{' | null' if nullable else ''};"
+            )
+        out.append("        };")
+        out.append("        Update: {")
+        for col_name in sorted(props.keys()):
+            col = props[col_name]
+            if col.get("readOnly") is True:
+                continue
+            ts = _ts_type_for_column(col)
+            nullable = col_name not in required
+            out.append(
+                f"          {col_name}?: {ts}{' | null' if nullable else ''};"
+            )
+        out.append("        };")
+        out.append("      };")
+
+    out.append("    };")
+    out.append("    Views: {")
+    for name in view_names:
+        # Views: emit Row only, with best-effort columns. Safer than guessing.
+        table = definitions.get(name, {})
+        props = table.get("properties", {}) or {}
+        required = set(table.get("required", []) or [])
+        out.append(f"      {name}: {{")
+        out.append("        Row: {")
+        out.extend(_emit_row(name, props, required))
+        out.append("        };")
+        out.append("      };")
+    out.append("    };")
+    out.append("    Functions: Record<string, never>;")
+    out.append("    Enums: Record<string, string>;")
+    out.append("    CompositeTypes: Record<string, never>;")
+    out.append("  };")
+    out.append("};")
+    return "\n".join(out) + "\n"
+
+
+def _infer_table_kind(name: str, table: dict[str, Any]) -> str:
+    """Best-effort table-vs-view classification from PostgREST OpenAPI hints.
+
+    PostgREST doesn't explicitly tag views in `definitions`, but views typically
+    have no primary-key-shaped `required` field. Conservative heuristic: any
+    definition with an `id` column in `required` is a table; everything else is
+    a view. Wrong classifications are recoverable (view treated as table is
+    still readable; we just lose Insert/Update typing).
+    """
+    required = set(table.get("required", []) or [])
+    if "id" in required:
+        return "table"
+    props = table.get("properties", {}) or {}
+    # Composite-PK tables often have multiple required *_id columns
+    if any(c.endswith("_id") for c in required) and len(required) >= 2:
+        return "table"
+    if "id" in props:
+        return "table"  # Mostly-nullable table is still a table
+    return "view"
+
+
+async def _introspect_supabase_schema(supabase_url: str, service_role_key: str) -> SupabaseSchema:
+    """Query PostgREST's OpenAPI endpoint and return a SupabaseSchema.
+
+    Failure modes return `ok=False` with a populated `error` — the caller MUST
+    check `ok` and refuse to inject the schema into LLM prompts when not ok.
+    Silently passing an error string into the architect was the original bug
+    that let it invent a fictional schema in the in-flight project.
     """
     import httpx
 
@@ -167,38 +340,88 @@ async def _introspect_supabase_schema(supabase_url: str, service_role_key: str) 
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(f"{base}/rest/v1/", headers=headers)
     except Exception as exc:
-        return f"[Supabase schema introspection failed: {exc}]"
+        return SupabaseSchema(ok=False, error=f"Network/connection error: {exc}")
 
     if resp.status_code != 200:
-        return f"[Supabase schema introspection failed: HTTP {resp.status_code} — {resp.text[:200]}]"
+        return SupabaseSchema(
+            ok=False,
+            error=f"HTTP {resp.status_code} from {base}/rest/v1/ — {resp.text[:200]}",
+        )
 
     try:
         spec = resp.json()
     except ValueError:
-        return "[Supabase schema introspection failed: invalid OpenAPI JSON]"
+        return SupabaseSchema(ok=False, error="Invalid OpenAPI JSON response")
 
     definitions = spec.get("definitions", {}) or {}
     if not definitions:
-        return "[Supabase schema is empty — no tables exposed via PostgREST]"
+        return SupabaseSchema(ok=False, error="No tables exposed via PostgREST (RLS or grants?)")
 
-    lines: list[str] = []
+    # Build all the result fields in one pass.
+    tables: dict[str, list[str]] = {}
+    table_kinds: dict[str, str] = {}
+    writable_cols: dict[str, list[str]] = {}
+    nullable_cols: dict[str, set[str]] = {}
+
+    md_lines: list[str] = []
+    md_lines.append(
+        "**This schema is the source of truth.** "
+        "If you find migration files in the repo with different column names, trust this schema, "
+        "NOT the migrations."
+    )
+    md_lines.append("")
+
+    # Group by kind for markdown grouping; tables first, then views.
+    for name, defn in definitions.items():
+        table_kinds[name] = _infer_table_kind(name, defn)
+
     for table_name in sorted(definitions.keys()):
         table = definitions[table_name]
         props = table.get("properties", {}) or {}
         required = set(table.get("required", []) or [])
-        cols = []
-        for col_name in sorted(props.keys()):
+        col_names = sorted(props.keys())
+        tables[table_name] = col_names
+        writable_cols[table_name] = [c for c in col_names if not props[c].get("readOnly")]
+        nullable_cols[table_name] = {c for c in col_names if c not in required}
+
+        kind = table_kinds[table_name]
+        kind_tag = "" if kind == "table" else " (view — read-only)"
+        cols_md = []
+        for col_name in col_names:
             col = props[col_name]
             t = col.get("format") or col.get("type") or "?"
             nullable = " NULL" if col_name not in required else ""
-            cols.append(f"  {col_name}: {t}{nullable}")
-        lines.append(f"### `{table_name}`\n" + "\n".join(cols))
+            ro = " READONLY" if col.get("readOnly") else ""
+            cols_md.append(f"  {col_name}: {t}{nullable}{ro}")
+        md_lines.append(f"### `{table_name}`{kind_tag}\n" + "\n".join(cols_md))
 
-    return (
-        "**This schema is the source of truth.** "
-        "If you find migration files in the repo with different column names, trust this schema, "
-        "NOT the migrations.\n\n"
-        + "\n\n".join(lines)
+    # Inferred relationships (heuristic only — PostgREST doesn't expose FKs).
+    rel_lines: list[str] = []
+    all_names = set(tables.keys())
+    for tname, cols in sorted(tables.items()):
+        for col in cols:
+            if col.endswith("_id") and col != "id":
+                stem = col[:-3]
+                if stem in all_names:
+                    rel_lines.append(f"- `{tname}.{col}` → likely `{stem}.id`")
+                elif (stem + "s") in all_names:
+                    rel_lines.append(f"- `{tname}.{col}` → likely `{stem}s.id`")
+    if rel_lines:
+        md_lines.append("")
+        md_lines.append("### Likely relationships (inferred from `_id` suffixes — not authoritative)")
+        md_lines.extend(rel_lines)
+
+    typescript = _build_typescript_types(definitions, table_kinds)
+
+    return SupabaseSchema(
+        ok=True,
+        error=None,
+        markdown="\n\n".join(md_lines),
+        typescript=typescript,
+        tables=tables,
+        table_kinds=table_kinds,
+        writable_cols=writable_cols,
+        nullable_cols=nullable_cols,
     )
 
 
@@ -344,6 +567,10 @@ class GitHubOrchestrator:
             "stage": "orchestration",
         }
         self._log_seq = 0
+        # Lazily populated by analyze_and_plan or get_supabase_schema(); shared
+        # with the builder + reviewer to avoid 40+ PostgREST calls per project.
+        self._cached_schema: SupabaseSchema | None = None
+        self._schema_cached_at: float = 0.0
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -356,6 +583,28 @@ class GitHubOrchestrator:
     async def _llm_config(self) -> dict[str, Any]:
         p = await self._project()
         return normalize_llm_config(p.get("llm_config_json") or p.get("llm_config") or {})
+
+    async def get_supabase_schema(self, ttl_seconds: int = 60) -> SupabaseSchema | None:
+        """Return the project's live Supabase schema, cached for `ttl_seconds`.
+
+        Returns None when the project has no Supabase creds. Returns a
+        SupabaseSchema with ok=False (and an error string) when introspection
+        was attempted but failed — callers should NOT inject the markdown into
+        prompts in that case.
+        """
+        now = asyncio.get_event_loop().time()
+        if self._cached_schema is not None and self._cached_schema.ok and (now - self._schema_cached_at) < ttl_seconds:
+            return self._cached_schema
+        p = await self._project()
+        url = (p.get("supabase_url") or "").strip()
+        key = (p.get("supabase_service_role_key") or "").strip()
+        if not url or not key:
+            return None
+        result = await _introspect_supabase_schema(url, key)
+        if result.ok:
+            self._cached_schema = result
+            self._schema_cached_at = now
+        return result
 
     def _set_trace(self, stage: str, actor: str = "orchestrator") -> None:
         self._trace_ctx["stage"] = stage
@@ -424,6 +673,34 @@ class GitHubOrchestrator:
         # Read repo context
         readme = await self.gh.read_file(owner, repo, "README.md") or ""
 
+        # Pre-architect Supabase schema introspection. Done BEFORE scaffolding
+        # so the generated `src/lib/supabase/database.types.ts` can land in the
+        # initial commit — that's the compile-time safety net. The architect's
+        # call site below reuses self._cached_schema if it's already populated.
+        early_schema: SupabaseSchema | None = None
+        early_supabase_url = (project.get("supabase_url") or "").strip()
+        early_supabase_key = (project.get("supabase_service_role_key") or "").strip()
+        if early_supabase_url and early_supabase_key:
+            await self._log("Pre-scaffold Supabase schema introspection", early_supabase_url, "RUNNING")
+            early_schema = await _introspect_supabase_schema(early_supabase_url, early_supabase_key)
+            if early_schema.ok:
+                self._cached_schema = early_schema
+                self._schema_cached_at = asyncio.get_event_loop().time()
+                await self._log(
+                    "Schema ready for scaffold",
+                    f"{len(early_schema.tables)} tables → real database.types.ts will be pushed",
+                    "SUCCESS",
+                )
+            else:
+                # Don't abort yet — the project may not actually use Supabase
+                # (we'll re-check after _build_stack_summary). But warn loudly.
+                await self._log(
+                    "Pre-scaffold schema introspection FAILED",
+                    f"{early_schema.error} — falling back to stub database.types.ts. "
+                    f"If this project actually uses Supabase, the architect run will abort.",
+                    "AMBIGUITY",
+                )
+
         # Pre-architect scaffolding step. If main has no package.json AND the
         # intake / README signals Next.js, push a vendored Next.js + Tailwind +
         # shadcn skeleton to main as a single batch of commits BEFORE the
@@ -437,6 +714,7 @@ class GitHubOrchestrator:
             intake_text=project.get("intake_text") or "",
             readme=readme,
             log_fn=self._log,
+            database_types_ts=(early_schema.typescript if early_schema and early_schema.ok else None),
         )
         if scaffolded:
             # Re-read README so the architect sees any scaffold-added README
@@ -531,21 +809,52 @@ class GitHubOrchestrator:
             figma_context = (figma_context + "\n\n" + figma_file_context).strip()
             await self._log("Figma file context included", f"{len(figma_file_context)} chars", "INFO")
 
-        # Introspect live Supabase schema so the architect plans against real columns,
-        # not whatever migrations / generic patterns it would otherwise guess.
-        supabase_schema = ""
+        # Reuse the schema we already introspected pre-scaffold (or run it now if
+        # the pre-scaffold step was skipped because creds were absent and only
+        # the scaffold added them). Abort loudly when Supabase deps are in
+        # package.json but the schema is unreadable — silently letting the
+        # architect proceed with no schema is what caused the in-flight project
+        # to invent a 3-migration fictional data layer.
+        supabase_schema: SupabaseSchema | None = self._cached_schema
         supabase_url = (project.get("supabase_url") or "").strip()
         supabase_key = (project.get("supabase_service_role_key") or "").strip()
-        if supabase_url and supabase_key:
+        supabase_in_pkg = "@supabase/supabase-js" in pkg_json or "@supabase/ssr" in pkg_json
+        if supabase_schema is None and supabase_url and supabase_key:
             await self._log("Introspecting Supabase schema", supabase_url, "RUNNING")
             supabase_schema = await _introspect_supabase_schema(supabase_url, supabase_key)
-            await self._log("Supabase schema loaded", f"{len(supabase_schema)} chars", "SUCCESS")
-        elif "@supabase/supabase-js" in pkg_json:
-            await self._log(
-                "Supabase detected but credentials missing",
-                "Set supabase_url + supabase_service_role_key on the project to enable schema-grounded planning",
-                "AMBIGUITY",
+            if supabase_schema.ok:
+                self._cached_schema = supabase_schema
+                self._schema_cached_at = asyncio.get_event_loop().time()
+                await self._log(
+                    "Supabase schema loaded",
+                    f"{len(supabase_schema.tables)} tables, {len(supabase_schema.markdown)} chars",
+                    "SUCCESS",
+                )
+
+        if supabase_in_pkg and (supabase_schema is None or not supabase_schema.ok):
+            err = (
+                supabase_schema.error if supabase_schema and supabase_schema.error
+                else "Supabase credentials not set on the project"
             )
+            await self._log(
+                "Supabase schema unavailable — planning ABORTED",
+                f"{err}\n\nThe project's package.json includes @supabase/supabase-js but the schema "
+                f"could not be read. Refusing to let the architect invent a fictional schema. "
+                f"Fix the supabase_url + supabase_service_role_key on the project (the URL should be "
+                f"`https://<ref>.supabase.co`, not the database URL), then re-run planning.",
+                "ERROR",
+            )
+            await emit_error(
+                self.project_id,
+                f"Schema introspection failed and Supabase is a project dependency. "
+                f"Planning aborted to prevent generating fictional schema. Detail: {err}",
+            )
+            return
+
+        if supabase_schema and not supabase_schema.ok:
+            # Creds set, introspection failed, but no Supabase deps → soft warn,
+            # don't inject error string into the prompt.
+            supabase_schema = None
 
         # Stack-specific best-practice skills from skills.sh / GitHub
         from orchestrator.skills import detect_skills, build_skill_context
@@ -563,8 +872,8 @@ class GitHubOrchestrator:
             user_msg += f"## Tech Stack Files{stack_context}\n\n"
         if skill_context:
             user_msg += f"{skill_context}\n\n"
-        if supabase_schema:
-            user_msg += f"## Live Supabase Schema\n\n{supabase_schema}\n\n"
+        if supabase_schema and supabase_schema.ok:
+            user_msg += f"## Live Supabase Schema\n\n{supabase_schema.markdown}\n\n"
         if figma_context:
             user_msg += f"## Figma Design Context\n\n{figma_context}\n\n"
         user_msg += "Produce the architecture document, stories document, and issue plan now."
@@ -1009,6 +1318,146 @@ class GitHubOrchestrator:
             + "\n\n".join(sections)
         )
 
+    @staticmethod
+    def _collect_supabase_references(diff: str) -> list[tuple[str, str, list[str]]]:
+        """Extract Supabase data references from a unified diff for schema validation.
+
+        Returns a list of (kind, table, columns) tuples where kind is one of
+        "select" (`.from("t").select("a,b")`) or "insert" (raw SQL insert).
+        Columns is the parsed column list — `["*"]` for `select("*")`, empty
+        list when the column projection isn't parseable.
+
+        Only inspects ADDED lines (`+` prefixed in the diff) — drift introduced
+        in this PR. Existing fictional references on the base branch are NOT
+        flagged here (they were the architect's job to prevent).
+        """
+        refs: list[tuple[str, str, list[str]]] = []
+        added_lines = [
+            line[1:] for line in diff.splitlines()
+            if line.startswith("+") and not line.startswith("+++")
+        ]
+        added_text = "\n".join(added_lines)
+
+        # Pattern A: .from("table").select("col1, col2, ...") — JS client style
+        # Handles single + double quotes; chained calls across one or two lines.
+        select_re = re.compile(
+            r'''\.from\(\s*["']([^"']+)["']\s*\)         # .from("table")
+                (?:\s*\.\w+\([^)]*\))*?                    # zero+ chained method calls
+                \s*\.select\(\s*["']([^"']*)["']            # .select("col1,col2,...")
+            ''',
+            re.VERBOSE | re.DOTALL,
+        )
+        for m in select_re.finditer(added_text):
+            table = m.group(1)
+            cols_raw = m.group(2).strip()
+            # PostgREST select syntax: "col1,col2,rel(col3,col4),*"
+            # We only check top-level columns; nested rel() projections are
+            # FK joins and validated separately by their referenced table.
+            cols: list[str] = []
+            depth = 0
+            current = []
+            for ch in cols_raw:
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
+                elif ch == "," and depth == 0:
+                    if current:
+                        cols.append("".join(current).strip())
+                        current = []
+                    continue
+                current.append(ch)
+            if current:
+                cols.append("".join(current).strip())
+            # Strip aliases / renames: "name:full_name" → "full_name"
+            cleaned = []
+            for c in cols:
+                if ":" in c:
+                    c = c.split(":")[-1].strip()
+                # Strip JSON / order operators like name->first
+                c = c.split("->")[0].split("(")[0].strip()
+                if c and c != "*":
+                    cleaned.append(c)
+            refs.append(("select", table, cleaned))
+
+        # Pattern B: .from("t").insert({...}) / .update({...}) — keys are columns
+        write_re = re.compile(
+            r'''\.from\(\s*["']([^"']+)["']\s*\)
+                (?:\s*\.\w+\([^)]*\))*?
+                \s*\.(insert|update|upsert)\(\s*(\{[^}]*\})
+            ''',
+            re.VERBOSE | re.DOTALL,
+        )
+        for m in write_re.finditer(added_text):
+            table = m.group(1)
+            obj_src = m.group(3)
+            # Pull bareword/quoted property keys: { foo: 1, "bar": 2 }
+            keys = re.findall(r'(?:^|[,{])\s*["\']?(\w+)["\']?\s*:', obj_src)
+            refs.append(("write", table, [k for k in keys if k]))
+
+        # Pattern C: raw SQL INSERT INTO table (a, b) VALUES — for migration / raw paths
+        sql_re = re.compile(
+            r'INSERT\s+INTO\s+["`]?(\w+)["`]?\s*\(\s*([^)]+)\)',
+            re.IGNORECASE,
+        )
+        for m in sql_re.finditer(added_text):
+            table = m.group(1)
+            cols = [c.strip().strip('"`') for c in m.group(2).split(",") if c.strip()]
+            refs.append(("write", table, cols))
+
+        return refs
+
+    @staticmethod
+    def _check_schema_violations(
+        refs: list[tuple[str, str, list[str]]],
+        schema: SupabaseSchema,
+    ) -> list[str]:
+        """Compare extracted refs against the schema; return human-readable violation lines.
+
+        Returns the list of violations to inject into the reviewer prompt as
+        CONFIRMED issues. Each line names the kind, table, and column.
+        Unknown tables produce one entry; known tables with unknown columns
+        produce one entry per missing column.
+        """
+        violations: list[str] = []
+        seen: set[str] = set()  # dedupe — diffs often repeat the same query
+        for kind, table, cols in refs:
+            if table not in schema.tables:
+                key = f"table:{table}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                violations.append(
+                    f"- Unknown table `{table}` referenced in a `{kind}` query. "
+                    f"Not in the live schema. (Available tables: "
+                    f"{', '.join(sorted(schema.tables.keys())[:10])}"
+                    f"{'...' if len(schema.tables) > 10 else ''})"
+                )
+                continue
+            known = set(schema.tables[table])
+            # For writes, validate against writable cols (excludes readOnly).
+            writable = set(schema.writable_cols.get(table, schema.tables[table]))
+            target_cols = writable if kind == "write" else known
+            for col in cols:
+                if col not in target_cols:
+                    key = f"col:{table}.{col}"
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    if col in known and kind == "write":
+                        violations.append(
+                            f"- `{table}.{col}` is read-only in the live schema; "
+                            f"cannot be used in `{kind}`."
+                        )
+                    else:
+                        violations.append(
+                            f"- Unknown column `{table}.{col}` in a `{kind}` query. "
+                            f"Did you mean one of: "
+                            f"{', '.join(sorted(known)[:8])}"
+                            f"{'...' if len(known) > 8 else ''}?"
+                        )
+        return violations
+
     async def review_pr(self, issue_number: int, pr_number: int) -> None:
         """Fetch the PR diff, call the reviewer LLM, post a comment, store the result."""
         project = await self._project()
@@ -1105,6 +1554,30 @@ class GitHubOrchestrator:
         diff_file_paths = re.findall(r'^\+\+\+ b/(.+)$', diff, re.MULTILINE)
         imported_sigs = await self._collect_imported_signatures(owner, repo, diff, diff_file_paths)
 
+        # Programmatic Supabase schema check — catches what the architect/builder
+        # might have missed (e.g. fictional `profiles.is_super_admin`). When
+        # confirmed violations exist, prepend them to the user message so the
+        # reviewer's "ISSUES FOUND when concrete issues exist" rule fires
+        # deterministically — no LLM judgment, no false positives.
+        schema_violations_block = ""
+        schema_for_review = await self.get_supabase_schema()
+        if schema_for_review and schema_for_review.ok:
+            refs = self._collect_supabase_references(diff)
+            violations = self._check_schema_violations(refs, schema_for_review)
+            if violations:
+                schema_violations_block = (
+                    "\n\n---\n\n## CONFIRMED schema violations (do NOT contradict)\n\n"
+                    "The following references in this PR do not match the live Supabase schema. "
+                    "These are mechanical, verified violations — they MUST appear under your "
+                    "Issues section verbatim. Output ISSUES FOUND.\n\n"
+                    + "\n".join(violations)
+                )
+                await self._log(
+                    f"Reviewer: {len(violations)} schema violation(s) on PR #{pr_number}",
+                    "\n".join(violations),
+                    "BLOCKER",
+                )
+
         # Stack-specific best-practice skills — give the reviewer the same context the
         # architect used so it can flag violations of those guidelines.
         from orchestrator.skills import detect_skills, build_skill_context
@@ -1123,6 +1596,7 @@ class GitHubOrchestrator:
             f"{issue_body}\n\n"
             f"---\n\n## PR Diff\n\n```diff\n{diff[:80000]}\n```"
             f"{imported_sigs}"
+            f"{schema_violations_block}"
         )
         if skill_context:
             user_msg += f"\n\n---\n\n{skill_context}"
@@ -1212,6 +1686,24 @@ class GitHubOrchestrator:
             )
             passed = True
 
+        # Mechanical schema check always wins. If we injected CONFIRMED schema
+        # violations into the user message and the model still returned PASSED,
+        # it ignored its instructions — force-fail. The violations are verifiable
+        # by Python; no LLM judgment to debate.
+        if schema_violations_block and passed:
+            logger.warning(
+                "PR review: model returned PASSED despite confirmed schema violations — overriding to FAIL"
+            )
+            passed = False
+            review_text = (
+                "ISSUES FOUND\n\n"
+                "Confirmed schema violations (mechanical check):\n\n"
+                + schema_violations_block.split("\n\n", 2)[-1]
+                + "\n\n---\n\n"
+                + "## Original LLM review (informational)\n\n"
+                + review_text
+            )
+
         await self._log(
             f"PR #{pr_number} review: {'PASSED' if passed else 'ISSUES FOUND'}",
             review_text[:200].replace("\n", " "),
@@ -1295,12 +1787,24 @@ class GitHubOrchestrator:
         skill_ids = detect_skills(_pkg, _tw, _comp)
         skill_context_for_body = await build_skill_context(skill_ids, "Best-practice context (apply these patterns)")
 
-        # Live schema (only if user provided Supabase creds at project creation)
+        # Live schema (only if user provided Supabase creds at project creation).
+        # On failure, surface the error in the context block rather than silently
+        # injecting a corrupt schema — the feedback classifier won't propose a
+        # fictional column if it sees a clear "schema unavailable" note.
         schema_context = "(not available — pass supabase creds at project creation to enable)"
         supabase_url = (project.get("supabase_url") or "").strip()
         supabase_key = (project.get("supabase_service_role_key") or "").strip()
         if supabase_url and supabase_key:
-            schema_context = await _introspect_supabase_schema(supabase_url, supabase_key)
+            schema_result = await _introspect_supabase_schema(supabase_url, supabase_key)
+            if schema_result.ok:
+                schema_context = schema_result.markdown
+            else:
+                schema_context = (
+                    f"(schema introspection failed: {schema_result.error}. "
+                    f"Do NOT propose tasks that depend on inferring the schema. "
+                    f"If the feedback requires DB work, mark `kind: \"existing_issue\"` and "
+                    f"add a note that the schema must be verified before implementation.)"
+                )
 
         prompt_tpl = _load_prompt("feedback_classifier_v1.txt")
         user_msg = prompt_tpl.format(
@@ -1778,6 +2282,14 @@ async def implement_with_aider(
     await update_github_issue_status(project_id, issue_number, "implementing")
     await emit_issues_updated(project_id, await _list_issues(project_id))
 
+    # Fetch the live Supabase schema (cached on the orchestrator instance) so
+    # both engines see authoritative table/column names. Without this the
+    # builder writes against fictional schemas — the original bug.
+    schema_for_builder = await orch.get_supabase_schema()
+    schema_md_for_builder: str | None = (
+        schema_for_builder.markdown if schema_for_builder and schema_for_builder.ok else None
+    )
+
     if engine == "agent_sdk":
         from orchestrator.builder.agent_sdk import implement_issue_via_agent_sdk
         # Agent SDK takes the raw model name (no LiteLLM "anthropic/" prefix).
@@ -1793,6 +2305,7 @@ async def implement_with_aider(
             model=sdk_model,
             is_reimplementation=is_reimplementation,
             extra_context=None,  # already prepended above for both engines
+            supabase_schema_markdown=schema_md_for_builder,
         )
         # Surface cost in activity log so the UI shows the cheaper engine's wins.
         await orch._log(
@@ -1816,6 +2329,7 @@ async def implement_with_aider(
             default_branch=default_branch,
             model=model,
             is_reimplementation=is_reimplementation,
+            supabase_schema_markdown=schema_md_for_builder,
         )
 
     if not branch:
