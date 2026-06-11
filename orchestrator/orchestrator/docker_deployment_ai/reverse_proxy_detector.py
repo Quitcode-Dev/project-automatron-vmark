@@ -44,6 +44,20 @@ def _container_is_traefik(c: ContainerInfo) -> bool:
     )
 
 
+def _owns_public_port(c: ContainerInfo) -> bool:
+    """True if the container publishes host port 80 or 443.
+
+    This is the edge-proxy signal: a containerised nginx/caddy *app* listening
+    only on an internal port (behind Traefik) does not own the public ports and
+    must not be mistaken for the reverse proxy.
+    """
+    for p in c.ports:
+        hp = str(p.get("host_port") or "")
+        if hp in ("80", "443"):
+            return True
+    return False
+
+
 def _container_is_kamal_proxy(c: ContainerInfo) -> bool:
     name_lower = c.name.lower()
     image_lower = c.image.lower()
@@ -142,12 +156,36 @@ def detect_reverse_proxy(
 
     # --- Classify ---
     if len(proxies_found) > 1:
-        return DetectionResult(
-            deployment_manager=DeploymentManager.mixed,
-            reverse_proxy=ReverseProxy.unknown,
-            confidence=0.9,
-            evidence=evidence + [f"Multiple proxies detected: {proxies_found}"],
-        )
+        # Multiple proxy *signals* often mean one real edge proxy plus backend
+        # apps that happen to embed nginx/caddy (e.g. an nginx app container
+        # behind Traefik). Disambiguate by host-port 80/443 ownership: if exactly
+        # one proxy type owns the public ports, that is the edge proxy and the
+        # rest are backend services — not a genuinely mixed setup.
+        proxy_containers = {
+            "kamal_proxy": kamal_proxy_containers,
+            "traefik": traefik_containers,
+            "nginx": nginx_containers,
+            "caddy": caddy_containers,
+        }
+        edge_types = {
+            t for t in proxies_found
+            if any(_owns_public_port(c) for c in proxy_containers.get(t, []))
+        }
+        if len(edge_types) == 1:
+            sole = next(iter(edge_types))
+            backends = proxies_found - {sole}
+            evidence.append(
+                f"Multiple proxy signals {sorted(proxies_found)}, but only {sole!r} "
+                f"owns host 80/443; treating {sorted(backends)} as backend services"
+            )
+            proxies_found = {sole}  # collapse to the edge proxy, fall through
+        else:
+            return DetectionResult(
+                deployment_manager=DeploymentManager.mixed,
+                reverse_proxy=ReverseProxy.unknown,
+                confidence=0.9,
+                evidence=evidence + [f"Multiple proxies detected: {proxies_found}"],
+            )
 
     if "kamal_proxy" in proxies_found:
         return DetectionResult(

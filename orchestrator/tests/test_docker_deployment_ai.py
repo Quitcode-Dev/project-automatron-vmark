@@ -234,14 +234,19 @@ async def test_gordon_require_raises_when_unavailable(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def _make_container(name: str, image: str = "", labels: dict | None = None) -> ContainerInfo:
+def _make_container(
+    name: str,
+    image: str = "",
+    labels: dict | None = None,
+    ports: list[dict] | None = None,
+) -> ContainerInfo:
     return ContainerInfo(
         id="abc12345",
         name=name,
         image=image or name,
         status="running",
         labels=labels or {},
-        ports=[],
+        ports=ports or [],
         mounts=[],
         env_keys=[],
         networks=[],
@@ -287,6 +292,35 @@ def test_detect_caddy():
 
 def test_detect_mixed():
     containers = [_make_container("traefik"), _make_container("nginx")]
+    result = detect_reverse_proxy(containers, [])
+    assert result.deployment_manager == DeploymentManager.mixed
+
+
+def test_edge_proxy_wins_over_backend_app():
+    # Real-world: Traefik owns host 80/443; an nginx app container sits behind
+    # it on an internal port only. This must resolve to Traefik, not "mixed".
+    containers = [
+        _make_container(
+            "traefik",
+            image="traefik:v3.6.12",
+            ports=[{"host_port": 80}, {"host_port": 443}],
+        ),
+        _make_container("portal", image="portal-portal", ports=[{"host_port": None}]),
+    ]
+    # ps output also shows nginx (the portal app embeds it) — the noisy signal
+    # that previously forced "mixed".
+    ps = "USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND\nroot 1 0 0 0 0 ? Ss 0:00 nginx: master process\n"
+    result = detect_reverse_proxy(containers, [], ps_output=ps)
+    assert result.reverse_proxy == ReverseProxy.traefik
+    assert result.deployment_manager == DeploymentManager.traefik
+
+
+def test_mixed_kept_when_two_edge_proxies_own_public_ports():
+    # Genuinely ambiguous: both bind host 80/443 → stay "mixed".
+    containers = [
+        _make_container("traefik", ports=[{"host_port": 80}]),
+        _make_container("nginx", ports=[{"host_port": 443}]),
+    ]
     result = detect_reverse_proxy(containers, [])
     assert result.deployment_manager == DeploymentManager.mixed
 
