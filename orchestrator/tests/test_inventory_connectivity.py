@@ -10,6 +10,7 @@ failure surfaces as status="error" with a meaningful message.
 
 from __future__ import annotations
 
+import json
 from unittest.mock import patch
 
 import aiosqlite
@@ -123,6 +124,74 @@ async def test_failed_connection_yields_error_snapshot():
         assert "Permission denied" in row["error_message"]
         # No misleading ~0.5 confidence on a dead connection
         assert row["confidence"] == 0.0
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_list_analyses_parses_normalized_json():
+    """list_docker_ai_analyses must expose the structured result, not just status.
+
+    The UI renders detected manager/proxy, evidence and risks from `normalized`.
+    """
+    from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator
+
+    db = await _make_db()
+    try:
+        normalized = {
+            "deployment_manager": "traefik",
+            "reverse_proxy": "traefik",
+            "confidence": 0.9,
+            "evidence": ["Traefik container(s): ['traefik']"],
+            "risks": ["port 443 already bound"],
+            "notes": "edge proxy present",
+        }
+        await db.execute(
+            "INSERT INTO docker_ai_analyses "
+            "(id, project_id, target_id, inventory_snapshot_id, provider, "
+            "analysis_type, raw_output, normalized_json, status, error_message, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "a-1", "p-1", "t-1", "snap-1", "litellm", "analyze_inventory",
+                "raw", json.dumps(normalized), "ok", None,
+                "2026-06-11T09:00:00+00:00",
+            ),
+        )
+        await db.commit()
+
+        orch = DockerDeploymentOrchestrator()
+        analyses = await orch.list_docker_ai_analyses("t-1", db)
+
+        assert len(analyses) == 1
+        a = analyses[0]
+        assert a["status"] == "ok"
+        assert a["inventory_snapshot_id"] == "snap-1"
+        assert "normalized_json" not in a  # popped, replaced by parsed dict
+        assert a["normalized"]["reverse_proxy"] == "traefik"
+        assert a["normalized"]["risks"] == ["port 443 already bound"]
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_list_analyses_tolerates_bad_normalized_json():
+    from orchestrator.docker_deployment_ai.orchestrator import DockerDeploymentOrchestrator
+
+    db = await _make_db()
+    try:
+        await db.execute(
+            "INSERT INTO docker_ai_analyses "
+            "(id, project_id, target_id, provider, analysis_type, raw_output, "
+            "normalized_json, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("a-2", "p-1", "t-1", "litellm", "analyze_inventory", "raw",
+             "{not valid json", "ok", "2026-06-11T09:00:00+00:00"),
+        )
+        await db.commit()
+
+        orch = DockerDeploymentOrchestrator()
+        analyses = await orch.list_docker_ai_analyses("t-1", db)
+        assert analyses[0]["normalized"] == {}
     finally:
         await db.close()
 

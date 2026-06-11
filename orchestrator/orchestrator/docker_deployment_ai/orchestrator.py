@@ -192,12 +192,23 @@ class DockerDeploymentOrchestrator:
     async def list_docker_ai_analyses(self, target_id: str, db: aiosqlite.Connection) -> list[dict[str, Any]]:
         db.row_factory = aiosqlite.Row
         cursor = await db.execute(
-            "SELECT id, provider, analysis_type, status, error_message, created_at "
+            "SELECT id, provider, analysis_type, status, error_message, created_at, "
+            "inventory_snapshot_id, normalized_json "
             "FROM docker_ai_analyses WHERE target_id = ? ORDER BY created_at DESC LIMIT 20",
             (target_id,),
         )
         rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        analyses: list[dict[str, Any]] = []
+        for r in rows:
+            data = dict(r)
+            # Parse the structured result so the UI can render details (detected
+            # manager/proxy, evidence, risks) instead of just a status string.
+            try:
+                data["normalized"] = json.loads(data.pop("normalized_json") or "{}")
+            except (ValueError, TypeError):
+                data["normalized"] = {}
+            analyses.append(data)
+        return analyses
 
     # ---- Plan ----
 

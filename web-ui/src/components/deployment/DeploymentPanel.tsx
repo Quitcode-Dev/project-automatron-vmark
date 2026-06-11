@@ -13,6 +13,7 @@ import {
   createDeploymentPlan,
   createDeploymentTarget,
   DeploymentPlan,
+  DockerAIAnalysis,
   DeploymentRun,
   DeploymentTarget,
   executeDeploymentPlan,
@@ -50,6 +51,83 @@ function ProviderBadge({ provider }: { provider: string | undefined }) {
     : "bg-purple-100 text-purple-800";
   return (
     <span className={`rounded px-2 py-0.5 text-xs font-semibold ${color}`}>{label}</span>
+  );
+}
+
+// ---- Analysis result card (details, not just a status string) ----
+function AnalysisCard({ analysis, expanded }: { analysis: DockerAIAnalysis; expanded: boolean }) {
+  const [open, setOpen] = useState(expanded);
+  const n = analysis.normalized ?? {};
+  const ok = analysis.status === "ok";
+  const confidencePct =
+    typeof n.confidence === "number" ? `${(n.confidence * 100).toFixed(0)}%` : null;
+  const hasDetails =
+    !!(n.deployment_manager || n.reverse_proxy || n.recommended_strategy ||
+       (n.evidence?.length) || (n.risks?.length) || n.notes || n.reasoning_summary);
+
+  return (
+    <div className="rounded-lg border border-border bg-background/40 p-2">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-2 text-left"
+      >
+        <span className="text-muted-foreground">{hasDetails ? (open ? "▾" : "▸") : "•"}</span>
+        <ProviderBadge provider={analysis.provider} />
+        <span className="text-muted-foreground">{analysis.analysis_type}</span>
+        <span className={ok ? "text-green-600" : "text-destructive"}>{analysis.status}</span>
+        {confidencePct && <span className="ml-auto text-muted-foreground">conf {confidencePct}</span>}
+      </button>
+
+      {!ok && analysis.error_message && (
+        <p className="mt-1 pl-5 text-destructive">{analysis.error_message}</p>
+      )}
+
+      {open && hasDetails && (
+        <div className="mt-2 space-y-1.5 pl-5">
+          {(n.deployment_manager || n.reverse_proxy) && (
+            <div className="flex flex-wrap gap-x-4">
+              {n.deployment_manager && (
+                <span><span className="text-muted-foreground">manager: </span><strong>{n.deployment_manager}</strong></span>
+              )}
+              {n.reverse_proxy && (
+                <span><span className="text-muted-foreground">proxy: </span><strong>{n.reverse_proxy}</strong></span>
+              )}
+            </div>
+          )}
+          {n.recommended_strategy && (
+            <p><span className="text-muted-foreground">recommended strategy: </span><strong>{n.recommended_strategy}</strong></p>
+          )}
+          {(n.notes || n.reasoning_summary) && (
+            <p className="text-muted-foreground">{n.notes || n.reasoning_summary}</p>
+          )}
+          {n.evidence && n.evidence.length > 0 && (
+            <div>
+              <p className="text-muted-foreground">evidence:</p>
+              <ul className="ml-3 list-disc">
+                {n.evidence.map((e, i) => <li key={i}>{e}</li>)}
+              </ul>
+            </div>
+          )}
+          {n.risks && n.risks.length > 0 && (
+            <div>
+              <p className="text-amber-600">risks:</p>
+              <ul className="ml-3 list-disc text-amber-700">
+                {n.risks.map((r, i) => <li key={i}>{r}</li>)}
+              </ul>
+            </div>
+          )}
+          {n.warnings && n.warnings.length > 0 && (
+            <div>
+              <p className="text-amber-600">warnings:</p>
+              <ul className="ml-3 list-disc text-amber-700">
+                {n.warnings.map((w, i) => <li key={i}>{w}</li>)}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -179,6 +257,22 @@ async function pollForNewInventory(
   }
   // Timed out — return whatever is latest (may still be the previous snapshot)
   return getLatestInventory(targetId).catch(() => null);
+}
+
+// Docker AI analysis is also a background task. Poll the list until a *new*
+// analysis (different newest id) appears, mirroring the inventory flow.
+async function pollForNewAnalysis(
+  targetId: string,
+  previousId: string | null,
+  { intervalMs = 2000, timeoutMs = 120000 }: { intervalMs?: number; timeoutMs?: number } = {},
+): Promise<DockerAIAnalysis[]> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const list = await listDockerAIAnalyses(targetId).catch(() => []);
+    if (list.length > 0 && list[0].id !== previousId) return list;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return listDockerAIAnalyses(targetId).catch(() => []);
 }
 
 // ---- Polling hook ----
@@ -444,9 +538,9 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
               <button
                 onClick={() =>
                   void action("Analyze", async () => {
+                    const previousId = analyses[0]?.id ?? null;
                     await runDockerAIAnalysis(selectedTarget.id);
-                    await new Promise((r) => setTimeout(r, 2000));
-                    const a = await listDockerAIAnalyses(selectedTarget.id).catch(() => []);
+                    const a = await pollForNewAnalysis(selectedTarget.id, previousId);
                     setAnalyses(a);
                   })
                 }
@@ -457,15 +551,9 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
               </button>
             </div>
             {analyses.length > 0 ? (
-              <div className="mt-3 space-y-1 text-xs">
-                {analyses.slice(0, 3).map((a) => (
-                  <div key={a.id} className="flex items-center gap-2">
-                    <ProviderBadge provider={a.provider} />
-                    <span className="text-muted-foreground">{a.analysis_type}</span>
-                    <span className={a.status === "ok" ? "text-green-600" : "text-destructive"}>
-                      {a.status}
-                    </span>
-                  </div>
+              <div className="mt-3 space-y-3 text-xs">
+                {analyses.slice(0, 3).map((a, i) => (
+                  <AnalysisCard key={a.id} analysis={a} expanded={i === 0} />
                 ))}
               </div>
             ) : (

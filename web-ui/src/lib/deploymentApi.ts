@@ -76,6 +76,20 @@ export interface InventorySnapshot {
   created_at: string;
 }
 
+export interface DockerAIAnalysisNormalized {
+  deployment_manager?: string;
+  reverse_proxy?: string;
+  confidence?: number;
+  evidence?: string[];
+  risks?: string[];
+  notes?: string;
+  // strategy-type analyses
+  recommended_strategy?: string;
+  reasoning_summary?: string;
+  warnings?: string[];
+  [key: string]: unknown;
+}
+
 export interface DockerAIAnalysis {
   id: string;
   provider: string;
@@ -83,6 +97,8 @@ export interface DockerAIAnalysis {
   status: string;
   error_message: string | null;
   created_at: string;
+  inventory_snapshot_id?: string | null;
+  normalized?: DockerAIAnalysisNormalized;
 }
 
 export interface DeploymentPlan {
