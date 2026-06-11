@@ -275,6 +275,22 @@ async function pollForNewAnalysis(
   return listDockerAIAnalyses(targetId).catch(() => []);
 }
 
+// Plan creation runs an LLM strategy call in a background task, so the row is
+// written several seconds after the POST returns. Poll the known plan_id
+// (tolerating 404 until it lands) instead of a fixed delay that races the LLM.
+async function pollForPlan(
+  planId: string,
+  { intervalMs = 2000, timeoutMs = 90000 }: { intervalMs?: number; timeoutMs?: number } = {},
+): Promise<DeploymentPlan | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const plan = await getDeploymentPlan(planId).catch(() => null);
+    if (plan) return plan;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return null;
+}
+
 // ---- Polling hook ----
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "error"]);
 
@@ -576,9 +592,14 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
                         preferred_strategy: selectedTarget.preferred_strategy,
                       });
                       if (r.plan_id) {
-                        // Poll until the background task writes the plan
-                        await new Promise((res) => setTimeout(res, 3000));
-                        const fetched = await getDeploymentPlan(r.plan_id);
+                        // Poll until the background task writes the plan (LLM
+                        // strategy call can take 5-15s — a fixed wait races it).
+                        const fetched = await pollForPlan(r.plan_id);
+                        if (!fetched) {
+                          throw new Error(
+                            "Plan generation timed out. The LLM strategy call may have failed — check orchestrator logs."
+                          );
+                        }
                         setPlan(fetched);
                         setValidation(null);
                         setApproved(false);
