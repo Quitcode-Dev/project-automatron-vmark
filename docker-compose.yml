@@ -10,6 +10,10 @@ services:
       - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
       - /var/automatron/workspaces:/var/automatron/workspaces
+      # Deployment-target SSH key (read-only). The container runs as root and
+      # the in-container path must match each target's auth_reference. Override
+      # the host path via DEPLOY_SSH_KEY; keep the container path stable.
+      - ${DEPLOY_SSH_KEY:-/root/.ssh/automatron_deploy-test}:/root/.ssh/automatron_deploy-test:ro
       # Dev: hot-reload
       - ./orchestrator/orchestrator:/app/orchestrator
       - ./orchestrator/prompts:/app/prompts
