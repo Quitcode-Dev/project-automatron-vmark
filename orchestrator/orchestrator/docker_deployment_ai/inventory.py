@@ -54,6 +54,34 @@ def _safe_run(client: SSHClient, cmd: str, timeout: int = 20) -> str:
         return ""
 
 
+def _probe_connectivity(client: SSHClient) -> str | None:
+    """Verify SSH actually connects before collecting inventory.
+
+    Without this gate, a failed connection (auth rejected, host unreachable,
+    host-key mismatch) is invisible: every `_safe_run` swallows its error and
+    returns "", producing a misleadingly "ok" snapshot with 0 containers and a
+    spurious ~0.5 detection confidence. We run one basic command (`whoami`) and
+    inspect the raw result so a connection-level failure surfaces as an error.
+
+    Returns an error message if the host is unreachable / auth fails, else None.
+    A reachable host whose Docker daemon is down still passes — that is a valid
+    inventory, captured separately via docker_binary_info.
+    """
+    try:
+        rc, stdout, stderr = client.run("whoami", timeout=15)
+    except SSHError as exc:
+        return f"SSH unavailable: {exc}"
+    # ssh exits 255 for its own failures (connection refused, auth, host key).
+    if rc == 255:
+        detail = stderr.strip()[:300] or "exit code 255"
+        return f"SSH connection failed: {detail}"
+    # Any other non-zero with no output means the basic shell probe didn't run.
+    if rc != 0 and not stdout.strip():
+        detail = stderr.strip()[:300] or f"exit code {rc}"
+        return f"SSH probe failed: {detail}"
+    return None
+
+
 def _collect_host_info(client: SSHClient) -> dict[str, Any]:
     hostname = _safe_run(client, "hostname").strip()
     uname = _safe_run(client, "uname -a").strip()
@@ -197,6 +225,13 @@ async def collect_inventory(
 
     try:
         logger.info("Collecting inventory for target %s (%s@%s)", target.id, target.ssh_user, target.host)
+
+        # Gate the whole collection on a real connectivity check: every helper
+        # below swallows SSH errors, so without this a dead connection yields a
+        # deceptively "ok" empty snapshot instead of a visible failure.
+        probe_error = _probe_connectivity(client)
+        if probe_error:
+            raise SSHError(probe_error)
 
         host_info = _collect_host_info(client)
         listening_ports = _collect_listening_ports(client)

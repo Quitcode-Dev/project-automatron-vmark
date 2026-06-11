@@ -161,6 +161,26 @@ function TargetForm({
   );
 }
 
+// ---- Inventory polling ----
+// The POST /inventory endpoint kicks off a background SSH collection (can take
+// 15-30s) and returns immediately with {status:"started"}. Polling the latest
+// snapshot until a *new* one (different id) appears avoids the race where the
+// UI fetches the stale/absent snapshot right after triggering the run.
+async function pollForNewInventory(
+  targetId: string,
+  previousId: string | null,
+  { intervalMs = 2000, timeoutMs = 90000 }: { intervalMs?: number; timeoutMs?: number } = {},
+): Promise<InventorySnapshot | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const s = await getLatestInventory(targetId).catch(() => null);
+    if (s && s.id !== previousId) return s;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  // Timed out — return whatever is latest (may still be the previous snapshot)
+  return getLatestInventory(targetId).catch(() => null);
+}
+
 // ---- Polling hook ----
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled", "error"]);
 
@@ -378,9 +398,9 @@ export default function DeploymentPanel({ projectId }: { projectId: string }) {
               <button
                 onClick={() =>
                   void action("Run Inventory", async () => {
+                    const previousId = snapshot?.id ?? null;
                     await runInventory(selectedTarget.id);
-                    await new Promise((r) => setTimeout(r, 2000));
-                    const s = await getLatestInventory(selectedTarget.id).catch(() => null);
+                    const s = await pollForNewInventory(selectedTarget.id, previousId);
                     setSnapshot(s);
                   })
                 }
