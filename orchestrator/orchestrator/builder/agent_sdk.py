@@ -402,6 +402,7 @@ async def implement_issue_via_agent_sdk(
     is_reimplementation: bool = False,
     extra_context: str | None = None,
     max_iterations: int = 40,
+    supabase_schema_markdown: str | None = None,
 ) -> tuple[str | None, str | None, UsageTotals]:
     """Run the Agent SDK tool loop and push a branch. Returns (branch, failure, usage).
 
@@ -479,6 +480,24 @@ async def implement_issue_via_agent_sdk(
         )
     else:
         user_message = f"# {issue_title}\n\n{issue_body}"
+
+    # Schema discipline: when the project has a live Supabase schema, prepend it
+    # with a hard "DO NOT INVENT" rule so the model treats it as authoritative.
+    # Without this, the model writes `from("profiles").select("is_super_admin")`
+    # against fictional tables based on standard auth-app priors — that bug
+    # cost the in-flight project 23 files of manual migration (PR #126).
+    if supabase_schema_markdown:
+        schema_block = (
+            "## Database schema — DO NOT INVENT TABLES OR COLUMNS\n\n"
+            f"{supabase_schema_markdown}\n\n"
+            "If your implementation needs a table or column not listed above, STOP. "
+            "Write a TODO comment naming the missing field instead of writing code that "
+            "references a fictional column — the build will fail at `npm run build` if "
+            "you reference columns that aren't in `database.types.ts`. Use "
+            "`Database[\"public\"][\"Tables\"][\"<table>\"][\"Row\"]` types when defining "
+            "shapes, so TypeScript catches typos.\n\n---\n\n"
+        )
+        user_message = schema_block + user_message
 
     # Tool loop
     client = AsyncAnthropic(api_key=settings.anthropic_api_key)

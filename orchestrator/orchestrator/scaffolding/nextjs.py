@@ -40,28 +40,50 @@ def _iter_fixture_files() -> list[tuple[str, str]]:
     return pairs
 
 
+_DATABASE_TYPES_REL = "src/lib/supabase/database.types.ts"
+
+
 async def scaffold_nextjs(
     gh: Any,
     owner: str,
     repo: str,
     log_fn: Any | None = None,
+    database_types_ts: str | None = None,
 ) -> None:
     """Push every file under fixtures/nextjs/ to `main` as a single commit.
 
     Uses the git data API (blobs + tree + commit + ref update) so all 17 files
     land in ONE commit instead of one-per-file. Falls back to per-file push if
     the git data API isn't available on the GitHubClient.
+
+    When `database_types_ts` is provided, the fixture stub for
+    `src/lib/supabase/database.types.ts` is replaced with the generated content.
+    This is the compile-time safety net: TypeScript will then reject any
+    `donor.assigned_solicitor_id` reference whose column isn't on the live
+    `donors` table, catching schema fiction at `npm run build` time.
     """
     files = _iter_fixture_files()
     if not files:
         logger.warning("scaffold_nextjs: no fixture files found at %s", _FIXTURES_ROOT)
         return
 
+    # Swap the stub for real generated types when available.
+    if database_types_ts:
+        files = [
+            (rel, database_types_ts) if rel == _DATABASE_TYPES_REL else (rel, content)
+            for rel, content in files
+        ]
+        logger.info(
+            "scaffold_nextjs: overriding stub %s with %d-char generated types",
+            _DATABASE_TYPES_REL, len(database_types_ts),
+        )
+
     logger.info("scaffold_nextjs: pushing %d fixture file(s) to %s/%s", len(files), owner, repo)
     if log_fn is not None:
         await log_fn(
             "Scaffolding: Next.js base",
-            f"Pushing {len(files)} files (package.json, configs, root layout, shadcn primitives) to main",
+            f"Pushing {len(files)} files (package.json, configs, root layout, shadcn primitives) to main"
+            + ("; using REAL database.types.ts from live Supabase schema" if database_types_ts else "; using stub database.types.ts (no Supabase creds)"),
             "RUNNING",
         )
 
