@@ -42,9 +42,11 @@ export function TourProvider() {
   const startTour = useCallback(() => {
     const isProject = pathname?.startsWith("/project/") ?? false;
     const steps = isProject ? projectTourSteps : dashboardTourSteps;
-    // Drop steps whose anchor isn't rendered so we never point at nothing.
+    // Drop steps whose anchor isn't rendered so we never point at nothing —
+    // EXCEPT steps flagged `keep` (their anchor appears later, e.g. modal fields
+    // revealed by a prior step's onNext).
     const present = steps.filter(
-      (s) => !s.element || document.querySelector(s.element as string)
+      (s) => s.keep || !s.element || document.querySelector(s.element as string)
     );
     if (present.length === 0) return;
 
@@ -55,10 +57,19 @@ export function TourProvider() {
       nextBtnText: "Next",
       prevBtnText: "Back",
       doneBtnText: "Done",
-      // Strip our custom `onShow` before handing steps to driver.js.
-      steps: present.map(({ onShow: _onShow, ...rest }) => rest),
-      // Run a step's side-effect (e.g. switch tab) as it's highlighted so the
-      // popover's description matches what's on screen.
+      // Map our steps to driver's shape. `onNext` lets a step run a side-effect
+      // (e.g. open the New Project modal) and advance once the DOM is ready.
+      // Only attach onNextClick when onNext exists — leaving the key present
+      // (even as undefined) suppresses driver.js's default advance.
+      steps: present.map((s) => {
+        const popover = s.popover ? { ...s.popover } : undefined;
+        if (popover && s.onNext) {
+          popover.onNextClick = () => s.onNext!(() => driverRef.current?.moveNext());
+        }
+        return { element: s.element, popover };
+      }),
+      // Run a step's `onShow` as it's highlighted so the popover's description
+      // matches what's on screen (switch tab, ensure the modal is open, …).
       onHighlightStarted: (_el, _step, opts) => {
         const idx = opts?.state?.activeIndex ?? 0;
         present[idx]?.onShow?.();

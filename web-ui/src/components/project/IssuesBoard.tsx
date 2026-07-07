@@ -145,7 +145,7 @@ export function IssuesBoard({
             <ScanSearch className={`h-3 w-3 ${isAuditing ? "animate-pulse" : ""}`} />
             {isAuditing ? "Auditing..." : "Audit Code"}
           </button>
-          <button onClick={onBuildCheck} disabled={isCheckingBuild}
+          <button onClick={onBuildCheck} disabled={isCheckingBuild} data-tour="build-check"
             className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted disabled:opacity-50">
             {isCheckingBuild ? <Loader2 className="h-3 w-3 animate-spin" /> : <Hammer className="h-3 w-3" />}
             {isCheckingBuild ? "Building..." : "Build Check"}
@@ -158,6 +158,7 @@ export function IssuesBoard({
           <button
             onClick={() => { setShowNewIssueForm((v) => !v); setTimeout(() => textareaRef.current?.focus(), 50); }}
             disabled={isCreatingIssue}
+            data-tour="new-issue"
             className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted disabled:opacity-50">
             {isCreatingIssue ? <Loader2 className="h-3 w-3 animate-spin" /> : <Plus className="h-3 w-3" />}
             {isCreatingIssue ? "Creating..." : "New Issue"}

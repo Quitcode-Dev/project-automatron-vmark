@@ -118,7 +118,7 @@ export function ChatPanel({
       </div>
 
       {/* Input */}
-      <div className="border-t border-border p-4">
+      <div className="border-t border-border p-4" data-tour="chat-input">
         <div className="flex gap-2">
           <input
             ref={inputRef}

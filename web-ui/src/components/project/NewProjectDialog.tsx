@@ -154,7 +154,7 @@ export function NewProjectDialog({ open, onClose }: NewProjectDialogProps) {
         </div>
 
         <form onSubmit={handleSubmit} className="mt-4 space-y-4">
-          <div>
+          <div data-tour="np-repo">
             <label className="mb-1.5 flex items-center gap-1.5 text-sm font-medium">
               GitHub Repository URL
               <InfoTip side="bottom">
@@ -177,7 +177,7 @@ export function NewProjectDialog({ open, onClose }: NewProjectDialogProps) {
             </p>
           </div>
 
-          <div>
+          <div data-tour="np-name">
             <label className="mb-1.5 block text-sm font-medium">Project Name</label>
             <input
               type="text"
@@ -189,7 +189,7 @@ export function NewProjectDialog({ open, onClose }: NewProjectDialogProps) {
           </div>
 
           {/* Figma Design URLs — optional */}
-          <div className="rounded-xl border border-border bg-background/60 p-4">
+          <div className="rounded-xl border border-border bg-background/60 p-4" data-tour="np-figma">
             <div className="flex items-center justify-between">
               <div>
                 <h3 className="text-sm font-semibold">Figma Designs</h3>
@@ -259,7 +259,7 @@ export function NewProjectDialog({ open, onClose }: NewProjectDialogProps) {
             </div>
           </div>
 
-          <div className="rounded-xl border border-border bg-background/60 p-4">
+          <div className="rounded-xl border border-border bg-background/60 p-4" data-tour="np-supabase">
             <div>
               <h3 className="text-sm font-semibold">Supabase (optional)</h3>
               <p className="mt-0.5 text-xs text-muted-foreground">
@@ -308,7 +308,7 @@ export function NewProjectDialog({ open, onClose }: NewProjectDialogProps) {
             </div>
           </div>
 
-          <div className="rounded-xl border border-border bg-background/60 p-4">
+          <div className="rounded-xl border border-border bg-background/60 p-4" data-tour="np-models">
             <h3 className="text-sm font-semibold">LLM Configuration</h3>
             <p className="mt-1 text-xs text-muted-foreground">
               Architect: plans issues. Reviewer: reviews PRs.
@@ -377,6 +377,7 @@ export function NewProjectDialog({ open, onClose }: NewProjectDialogProps) {
             </button>
             <button
               type="submit"
+              data-tour="np-submit"
               disabled={!name.trim() || !repoUrl.trim() || isSubmitting}
               className="rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90 disabled:opacity-50"
             >
