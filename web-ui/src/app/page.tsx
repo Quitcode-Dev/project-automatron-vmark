@@ -6,8 +6,10 @@ import { ProjectCard } from "@/components/project/ProjectCard";
 import { NewProjectDialog } from "@/components/project/NewProjectDialog";
 import { useProjectStore } from "@/stores/projectStore";
 import { useWebSocket } from "@/hooks/useWebSocket";
+import Link from "next/link";
 import { Plus, FolderKanban } from "lucide-react";
 import { deleteProject as apiDeleteProject } from "@/lib/api";
+import { GettingStartedChecklist } from "@/components/onboarding/GettingStartedChecklist";
 
 export default function DashboardPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -43,6 +45,7 @@ export default function DashboardPage() {
           </p>
         </div>
         <button
+          data-tour="new-project"
           onClick={() => setDialogOpen(true)}
           className="flex items-center gap-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-medium text-primary-foreground transition-colors hover:bg-primary/90"
         >
@@ -50,6 +53,8 @@ export default function DashboardPage() {
           New Project
         </button>
       </div>
+
+      <GettingStartedChecklist />
 
       {/* Project grid */}
       {isLoading ? (
@@ -70,6 +75,12 @@ export default function DashboardPage() {
             <Plus className="h-4 w-4" />
             Create Project
           </button>
+          <Link
+            href="/learn/what-is-automatron"
+            className="mt-3 text-xs text-muted-foreground hover:text-foreground"
+          >
+            New here? Learn how Automatron works →
+          </Link>
         </div>
       ) : (
         <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">

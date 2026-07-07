@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useMemo, useRef } from "react";
+import Link from "next/link";
 import type { GithubIssue } from "@/lib/types";
 import { IssueCard } from "./IssueCard";
 import {
@@ -120,6 +121,9 @@ export function IssuesBoard({
       <div className="flex flex-col items-center justify-center py-16 text-center text-muted-foreground">
         <p className="text-sm">No issues yet.</p>
         <p className="mt-1 text-xs">Approve the plan to generate GitHub Issues.</p>
+        <Link href="/learn/the-build-loop" className="mt-2 text-xs text-primary hover:underline">
+          How the build loop works →
+        </Link>
       </div>
     );
   }

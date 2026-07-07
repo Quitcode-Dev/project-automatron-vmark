@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { InfoTip } from "@/components/ui/InfoTip";
 import type { GithubIssue, IssueStatus } from "@/lib/types";
 import {
   ExternalLink, GitPullRequest, CheckCircle2, Circle,
@@ -160,6 +161,15 @@ export function IssueCard({ issue, onReview, onAssignCopilot, onImplement, onPre
                 {isImplementing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Bot className="h-3 w-3" />}
                 {isImplementing ? "Working…" : "Implement"}
               </button>
+            )}
+
+            {vs === "open" && (
+              <InfoTip>
+                <strong>Assign Copilot</strong> hands the issue to GitHub&apos;s Copilot
+                coding agent (needs a Copilot plan that includes it).{" "}
+                <strong>Implement</strong> uses Automatron&apos;s built-in Agent SDK
+                builder with your Anthropic key — no Copilot plan needed.
+              </InfoTip>
             )}
 
             {/* Request AI Review — when PR is open */}

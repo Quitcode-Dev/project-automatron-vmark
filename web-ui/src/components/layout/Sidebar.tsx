@@ -8,12 +8,14 @@ import {
   Bot,
   Settings,
   FolderKanban,
+  BookOpen,
   Zap,
 } from "lucide-react";
 
 const navItems = [
   { href: "/", label: "Dashboard", icon: LayoutDashboard },
   { href: "/projects", label: "Projects", icon: FolderKanban },
+  { href: "/learn", label: "Learn", icon: BookOpen },
 ];
 
 export function Sidebar() {
@@ -30,7 +32,7 @@ export function Sidebar() {
       </div>
 
       {/* Navigation */}
-      <nav className="flex-1 space-y-1 px-3 py-4">
+      <nav data-tour="sidebar-nav" className="flex-1 space-y-1 px-3 py-4">
         {navItems.map((item) => {
           const isActive =
             item.href === "/"

@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import * as api from "@/lib/api";
+import { InfoTip } from "@/components/ui/InfoTip";
 import {
   cloneProjectLlmConfig,
   defaultProjectLlmConfig,
@@ -154,7 +155,15 @@ export function NewProjectDialog({ open, onClose }: NewProjectDialogProps) {
 
         <form onSubmit={handleSubmit} className="mt-4 space-y-4">
           <div>
-            <label className="mb-1.5 block text-sm font-medium">GitHub Repository URL</label>
+            <label className="mb-1.5 flex items-center gap-1.5 text-sm font-medium">
+              GitHub Repository URL
+              <InfoTip side="bottom">
+                Automatron needs a GitHub token with write access to this repo.
+                Required PAT scopes: <code>repo</code>, <code>workflow</code>, and{" "}
+                <code>admin:repo_hook</code> (for webhook auto-registration). An
+                operator sets this in the server env.
+              </InfoTip>
+            </label>
             <input
               type="text"
               value={repoUrl}

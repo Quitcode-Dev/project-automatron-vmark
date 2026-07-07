@@ -2,6 +2,7 @@
 
 import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
+import { TourProvider } from "@/components/onboarding/TourProvider";
 
 interface AppLayoutProps {
   children: React.ReactNode;
@@ -15,6 +16,7 @@ export function AppLayout({ children }: AppLayoutProps) {
         <Header />
         <main className="flex-1 overflow-auto p-6">{children}</main>
       </div>
+      <TourProvider />
     </div>
   );
 }

@@ -14,6 +14,7 @@ import {
   llmProviders,
 } from "@/lib/llmOptions";
 import { AlertPanel, LogStream, ProgressBar, StatusBadge } from "@/components/ui";
+import { StageCoach } from "@/components/onboarding/StageCoach";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useProjectStore } from "@/stores/projectStore";
 import type {
@@ -442,7 +443,7 @@ export default function ProjectPage() {
           Back to projects
         </button>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2" data-tour="action-bar">
           {currentProject.repo_url && (
             <a
               href={currentProject.repo_url}
@@ -546,7 +547,7 @@ export default function ProjectPage() {
               <StatusBadge status={currentProject.status} size="md" />
             </div>
 
-            <div className="mt-4 grid gap-3 md:grid-cols-5">
+            <div className="mt-4 grid gap-3 md:grid-cols-5" data-tour="stage-tracker">
               {groupedStages.map(({ group, activeStage, complete }) => (
                 <div
                   key={group}
@@ -823,7 +824,9 @@ export default function ProjectPage() {
           </div>
         </div>
 
-      <div className="mb-4 flex gap-1 rounded-lg border border-border bg-muted p-1">
+      <StageCoach key={currentProject.project_stage} stage={currentProject.project_stage} />
+
+      <div className="mb-4 flex gap-1 rounded-lg border border-border bg-muted p-1" data-tour="tabs">
         {(["chat", "plan", "issues", "preview", "activity", "deploy"] as ActiveTab[]).map((tab) => (
           <button
             key={tab}
