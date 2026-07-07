@@ -69,7 +69,7 @@ export function GettingStartedChecklist() {
   if (doneCount === items.length) return null;
 
   return (
-    <div className="mb-6 rounded-xl border border-border bg-card p-5">
+    <div className="mb-6 rounded-xl border border-border bg-card p-5" data-tour="checklist">
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-sm font-semibold">Getting started</h2>

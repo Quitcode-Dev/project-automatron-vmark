@@ -55,7 +55,14 @@ export function TourProvider() {
       nextBtnText: "Next",
       prevBtnText: "Back",
       doneBtnText: "Done",
-      steps: present,
+      // Strip our custom `onShow` before handing steps to driver.js.
+      steps: present.map(({ onShow: _onShow, ...rest }) => rest),
+      // Run a step's side-effect (e.g. switch tab) as it's highlighted so the
+      // popover's description matches what's on screen.
+      onHighlightStarted: (_el, _step, opts) => {
+        const idx = opts?.state?.activeIndex ?? 0;
+        present[idx]?.onShow?.();
+      },
       onDestroyed: () => {
         markTourSeen(email);
       },

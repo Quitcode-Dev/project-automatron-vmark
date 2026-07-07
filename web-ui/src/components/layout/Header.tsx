@@ -4,11 +4,13 @@ import { StatusBadge } from "@/components/ui";
 import { UserMenu } from "@/components/layout/UserMenu";
 import { cn } from "@/lib/utils";
 import { useProjectStore } from "@/stores/projectStore";
-import { AlertTriangle, Wifi, WifiOff } from "lucide-react";
+import { useOnboardingStore } from "@/stores/onboardingStore";
+import { AlertTriangle, Wifi, WifiOff, HelpCircle } from "lucide-react";
 
 export function Header() {
   const { isConnected, currentProject, humanRequired, humanReason, error } =
     useProjectStore();
+  const requestReplay = useOnboardingStore((s) => s.requestReplay);
 
   return (
     <header className="flex h-16 items-center justify-between border-b border-border bg-card px-6">
@@ -52,6 +54,16 @@ export function Header() {
           )}
           <span>{isConnected ? "Connected" : "Disconnected"}</span>
         </div>
+
+        <button
+          data-tour="help"
+          onClick={() => requestReplay()}
+          title="Take the walkthrough"
+          className="flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+        >
+          <HelpCircle className="h-4 w-4" />
+          <span className="hidden sm:inline">Tour</span>
+        </button>
 
         <UserMenu />
       </div>

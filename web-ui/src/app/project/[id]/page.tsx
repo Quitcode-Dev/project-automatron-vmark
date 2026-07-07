@@ -606,7 +606,7 @@ export default function ProjectPage() {
           </div>
 
           <div className="grid gap-4">
-            <div className="rounded-xl border border-border bg-card p-4">
+            <div className="rounded-xl border border-border bg-card p-4" data-tour="llm-config">
               <div className="flex items-center justify-between gap-4">
                 <div>
                   <p className="text-xs uppercase tracking-[0.18em] text-muted-foreground">
@@ -830,6 +830,7 @@ export default function ProjectPage() {
         {(["chat", "plan", "issues", "preview", "activity", "deploy"] as ActiveTab[]).map((tab) => (
           <button
             key={tab}
+            data-tab={tab}
             onClick={() => setActiveTab(tab)}
             className={`flex-1 rounded-md px-3 py-1.5 text-sm font-medium capitalize transition-colors ${
               activeTab === tab
