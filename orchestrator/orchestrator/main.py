@@ -41,10 +41,19 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # CORS (private network, permissive for MVP)
+    # CORS. The frontend calls the API with credentials (the Auth.js cookie), and
+    # browsers reject a wildcard `Access-Control-Allow-Origin` on credentialed
+    # requests — so we echo concrete origins instead of "*". Localhost (any port)
+    # is allowed via regex for cross-origin local dev; the public URL and any
+    # configured extras are allowed explicitly. Production is same-origin behind
+    # Traefik, so CORS mostly matters for local dev.
+    _cors_origins = [o.strip() for o in settings.cors_allow_origins.split(",") if o.strip()]
+    if settings.automatron_public_url:
+        _cors_origins.append(settings.automatron_public_url.rstrip("/"))
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=_cors_origins,
+        allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?",
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

@@ -108,6 +108,11 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8000
     debug: bool = False
+    # Extra CORS origins (comma-separated). The browser rejects a wildcard
+    # origin on credentialed requests, so we echo concrete origins instead:
+    # any localhost/127.0.0.1 port (dev) is allowed via regex, AUTOMATRON_PUBLIC_URL
+    # is added automatically, and anything here is appended for other deployments.
+    cors_allow_origins: str = ""
 
     # --- Auth (Google OAuth via Auth.js v5) ---
     # AUTH_SECRET is shared with the web-ui's NextAuth config. Used to verify the

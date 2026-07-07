@@ -1,5 +1,9 @@
 import { auth } from "@/auth";
-import { NextResponse } from "next/server";
+import {
+  NextResponse,
+  type NextRequest,
+  type NextFetchEvent,
+} from "next/server";
 
 // Paths that should bypass auth. Order matters — first match wins.
 const PUBLIC_PATHS = [
@@ -14,7 +18,12 @@ function isPublic(pathname: string): boolean {
   return PUBLIC_PATHS.some((p) => pathname === p || pathname.startsWith(p + "/"));
 }
 
-export default auth((req) => {
+// Local-dev escape hatch (mirrors the backend's AUTOMATRON_DEV_NO_AUTH): skip
+// auth entirely so a test browser / headless run can reach the app without
+// Google login. MUST stay unset in production.
+const DEV_NO_AUTH = process.env.AUTOMATRON_DEV_NO_AUTH === "true";
+
+const guarded = auth((req) => {
   const { pathname } = req.nextUrl;
 
   if (isPublic(pathname)) {
@@ -33,6 +42,14 @@ export default auth((req) => {
 
   return NextResponse.next();
 });
+
+export default function middleware(req: NextRequest, event: NextFetchEvent) {
+  if (DEV_NO_AUTH) {
+    return NextResponse.next();
+  }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (guarded as any)(req, event);
+}
 
 export const config = {
   // Run on every path EXCEPT static assets that don't go through Next.js.
