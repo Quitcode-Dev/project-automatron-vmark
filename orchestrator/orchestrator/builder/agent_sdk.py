@@ -1,22 +1,22 @@
-"""Anthropic Agent SDK builder — experimental alternative to Aider.
+"""Anthropic Agent SDK builder — Automatron's issue implementation engine.
 
-Drop-in replacement for `aider_agent.implement_issue`. Same input/output
-signature so it can be swapped in via `implement_with_aider(builder_engine=...)`.
+Given a GitHub issue, it drives an Anthropic tool-use loop to implement the
+change, pushes a branch, and reports token usage back to the caller.
 
-Why try this:
-- Aider's whole/diff edit formats produce parser failures (bogus root files,
-  missed deletions, route collisions) that we keep writing sanitisers for.
-- Aider's prompt caching is all-or-nothing per CLI invocation; the Agent SDK
-  lets us cache per tool-call so context survives across architect→build→retry.
+Design notes:
 - Tool-use forces the model to declare a target path before writing; no
   silent ".gitignore housekeeping" when it doesn't know what to do.
+- Prompt caching is per tool-call, so context survives across
+  architect→build→retry.
+- The tool surface is intentionally small — every tool added is a failure
+  mode added.
 
-Tool surface (intentionally small — every tool added is a failure mode added):
+Tool surface:
   read_file, write_file, edit_file, list_dir, glob_files, grep_files,
   delete_file, run_build, done.
 
 Token tracking returns (input, output, cache_creation, cache_read) at the end
-so the comparison harness can compute real $/run.
+so callers can compute real $/run.
 """
 from __future__ import annotations
 
@@ -29,12 +29,35 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from orchestrator.aider_agent import _run  # reuse shell helper
 from orchestrator.build_check import run_build_in_docker
 from orchestrator.config import settings
 from orchestrator.logsafe import redact
 
 logger = logging.getLogger(__name__)
+
+
+async def _run(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    timeout: int = 120,
+) -> tuple[int, str]:
+    """Run a subprocess to completion, capturing combined stdout/stderr."""
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+        cwd=cwd,
+        env=env,
+    )
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        return proc.returncode or 0, stdout.decode(errors="replace")
+    except asyncio.TimeoutError:
+        proc.kill()
+        return 1, f"Command timed out after {timeout}s"
 
 
 # ── Token usage tracking ─────────────────────────────────────────────────────
@@ -388,7 +411,7 @@ inline it in an existing file or ask via grep_files first whether something simi
 When in doubt, read more before writing. Edits should be small and intentional."""
 
 
-# ── Main entry — mirrors aider_agent.implement_issue ─────────────────────────
+# ── Main entry ───────────────────────────────────────────────────────────────
 
 async def implement_issue_via_agent_sdk(
     project_id: str,
@@ -406,10 +429,10 @@ async def implement_issue_via_agent_sdk(
 ) -> tuple[str | None, str | None, UsageTotals]:
     """Run the Agent SDK tool loop and push a branch. Returns (branch, failure, usage).
 
-    NOTE — extra args vs aider_agent.implement_issue:
-      - extra_context: same purpose as the prepended PRIMARY DIRECTIVE
-      - max_iterations: hard cap on tool-loop iterations (Aider has its own cap)
-      - returns UsageTotals as third element for the comparison harness
+    Args of note:
+      - extra_context: prepended PRIMARY DIRECTIVE (error to fix on retry)
+      - max_iterations: hard cap on tool-loop iterations
+      - returns UsageTotals as the third element so callers can log real $/run
     """
     try:
         from anthropic import AsyncAnthropic
@@ -419,8 +442,7 @@ async def implement_issue_via_agent_sdk(
     if not settings.anthropic_api_key:
         return None, "ANTHROPIC_API_KEY not set", UsageTotals()
 
-    # Workspace setup — same shape as aider_agent, just inlined here so the A/B
-    # is a fair fight (no dependency on Aider-specific git-state assumptions).
+    # Workspace setup — dedicated clone dir for the builder.
     workspace = settings.workspace_base_dir / str(project_id)
     workspace.mkdir(parents=True, exist_ok=True)
     repo_dir = workspace / "repo-agent-sdk"

@@ -82,7 +82,7 @@ interface ProjectState {
   auditProject: (projectId: string) => Promise<void>;
   assignToCopilot: (projectId: string) => Promise<{ assigned: number; failed: number }>;
   assignIssueToCopilot: (projectId: string, issueNumber: number) => Promise<void>;
-  implementWithAider: (projectId: string, issueNumber: number) => Promise<void>;
+  implementIssue: (projectId: string, issueNumber: number) => Promise<void>;
   triggerPRReview: (projectId: string, issueNumber: number, prNumber: number) => Promise<void>;
   createIssueFromPrompt: (projectId: string, prompt: string) => Promise<void>;
   buildFailure: { errorSummary: string; defaultBranch: string } | null;
@@ -491,9 +491,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     }
   },
 
-  implementWithAider: async (projectId, issueNumber) => {
+  implementIssue: async (projectId, issueNumber) => {
     try {
-      await api.implementWithAider(projectId, issueNumber);
+      await api.implementIssue(projectId, issueNumber);
     } catch (error: any) {
       set({ error: error.message });
     }

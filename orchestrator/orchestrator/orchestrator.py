@@ -705,8 +705,8 @@ class GitHubOrchestrator:
         # intake / README signals Next.js, push a vendored Next.js + Tailwind +
         # shadcn skeleton to main as a single batch of commits BEFORE the
         # architect plans any issues. Eliminates the recurring failure mode where
-        # the architect generates an "Initialize project" task that Aider can't
-        # actually fulfil (no shell exec, only file edits) — see the root-cause
+        # the architect generates an "Initialize project" task that the builder
+        # can't actually fulfil (only file edits) — see the root-cause
         # plan in /Users/qc3/.claude/plans/atomic-fluttering-duckling.md.
         from orchestrator.scaffolding import maybe_scaffold_repo
         scaffolded = await maybe_scaffold_repo(
@@ -1039,8 +1039,8 @@ class GitHubOrchestrator:
                 for task in story.get("tasks", []):
                     task_title = task.get("title", "Untitled Task")
                     # Skill content stays in the architect prompt (and reviewer), NOT in
-                    # the issue body — Aider gets the spec the architect produced, and the
-                    # raw skill prose would only inflate input tokens at implementation time.
+                    # the issue body — the builder gets the spec the architect produced, and
+                    # the raw skill prose would only inflate input tokens at implementation time.
                     body = _render_issue_body(task, epic_title, story_title, stack_summary)
                     # GitHub label names are capped at 50 chars
                     label_name = story_title[:50] if story_title else ""
@@ -1204,6 +1204,7 @@ class GitHubOrchestrator:
                 self.project_id,
                 status="building",
                 stage="building",
+                progress={},
                 preview_url=preview_url,
             )
         else:
@@ -1717,9 +1718,16 @@ class GitHubOrchestrator:
             "head_sha": head_sha,  # for cache-skip on next webhook firing
         }
 
+        # Preserve the real PR url (set when the PR opened). `issue` here is the
+        # GitHub *issue* object, so issue.html_url points at the issue, not the
+        # PR — using it would break the "PR #n" link and "Approve & Merge".
+        from orchestrator.models.project import _get_github_issue
+        _local_for_url = await _get_github_issue(self.project_id, issue_number)
+        pr_url = (_local_for_url or {}).get("pr_url") or issue.get("html_url", "")
+
         await update_github_issue_pr(
             self.project_id, issue_number, pr_number,
-            issue.get("html_url", ""),
+            pr_url,
             status="pr_reviewed",
             pr_review=review_data,
         )
@@ -2099,6 +2107,44 @@ class GitHubOrchestrator:
         )
 
 
+# ── Cancellable orchestration task registry ───────────────────────────────────
+# FastAPI BackgroundTasks give no handle to cancel, so long-running orchestration
+# (planning/building) is launched through here instead — letting POST /stop
+# actually interrupt the work rather than just flipping a DB label. A project
+# runs at most one tracked task at a time.
+_running_tasks: dict[str, asyncio.Task] = {}
+
+
+def run_tracked(project_id: str, coro: Any) -> None:
+    """Launch an orchestration coroutine as a cancellable, tracked asyncio task."""
+    existing = _running_tasks.get(project_id)
+    if existing and not existing.done():
+        existing.cancel()
+
+    async def _wrapper() -> None:
+        try:
+            await coro
+        except asyncio.CancelledError:
+            logger.info("Orchestration for %s cancelled (stopped by user)", project_id)
+        except Exception:  # already logged + surfaced by the runner's own try/except
+            pass
+        finally:
+            if _running_tasks.get(project_id) is task:
+                _running_tasks.pop(project_id, None)
+
+    task = asyncio.create_task(_wrapper())
+    _running_tasks[project_id] = task
+
+
+def cancel_project_task(project_id: str) -> bool:
+    """Cancel a project's running orchestration task. Returns True if one was live."""
+    task = _running_tasks.get(project_id)
+    if task and not task.done():
+        task.cancel()
+        return True
+    return False
+
+
 # ── Module-level runner functions (called by API routes) ──────────────────────
 
 async def start_project(project_id: str) -> None:
@@ -2109,6 +2155,7 @@ async def start_project(project_id: str) -> None:
     except Exception as exc:
         logger.error("start_project failed for %s: %s", project_id, exc)
         await update_project(project_id, status="error", project_stage="error")
+        await emit_status_update(project_id, status="error", stage="error", progress={})
         await emit_error(project_id, f"{type(exc).__name__}: {exc}")
         raise
 
@@ -2123,6 +2170,7 @@ async def resume_project(project_id: str, approval_type: str, approved: bool = T
         except Exception as exc:
             logger.error("resume_project (plan) failed for %s: %s", project_id, exc)
             await update_project(project_id, status="error", project_stage="error")
+            await emit_status_update(project_id, status="error", stage="error", progress={})
             await emit_error(project_id, f"{type(exc).__name__}: {exc}")
             raise
 
@@ -2196,16 +2244,17 @@ async def assign_to_copilot_issue(project_id: str, issue_number: int) -> dict:
     return {"assigned": 1, "issue_number": issue_number}
 
 
-async def implement_with_aider(
+async def implement_issue_with_builder(
     project_id: str, issue_number: int, extra_context: str | None = None,
 ) -> None:
-    """Clone the repo, run Aider on the issue, push a branch, open a PR.
+    """Clone the repo, run the Agent SDK builder on the issue, push a branch, open a PR.
 
-    `extra_context`, when provided, is appended to the issue body before Aider
-    sees it. Used by the "Send to Aider" button on ERROR-level activity rows so
-    a build error / type error / runtime crash gets fed back as a fix directive.
+    `extra_context`, when provided, is prepended to the issue body before the
+    builder sees it. Used by the "Retry with context" button on ERROR-level
+    activity rows so a build error / type error / runtime crash gets fed back as
+    a fix directive.
     """
-    from orchestrator.aider_agent import implement_issue
+    from orchestrator.builder.agent_sdk import implement_issue_via_agent_sdk
     from orchestrator.models.project import update_github_issue_pr
 
     orch = GitHubOrchestrator(project_id)
@@ -2213,20 +2262,20 @@ async def implement_with_aider(
     owner = project.get("github_repo_owner") or ""
     repo = project.get("github_repo_name") or ""
     if not owner or not repo:
-        await orch._log(f"Aider #{issue_number}: no repo configured", "", "ERROR")
+        await orch._log(f"Builder #{issue_number}: no repo configured", "", "ERROR")
         return
 
     # Read issue from GitHub
     issue_data = await orch.gh.get_issue(owner, repo, issue_number)
     if not issue_data:
-        await orch._log(f"Aider #{issue_number}: issue not found", "", "ERROR")
+        await orch._log(f"Builder #{issue_number}: issue not found", "", "ERROR")
         return
 
     issue_title = issue_data.get("title", f"Issue #{issue_number}")
     issue_body = issue_data.get("body", "")
     default_branch = project.get("default_branch") or "main"
 
-    # Append previous review feedback so Aider knows what to fix
+    # Append previous review feedback so the builder knows what to fix
     from orchestrator.models.project import _get_github_issue
     local_issue = await _get_github_issue(project_id, issue_number)
     existing_pr_number = local_issue.get("pr_number") if local_issue else None
@@ -2244,7 +2293,7 @@ async def implement_with_aider(
         # multi-KB spec, the LLM treated it as a footnote and kept executing
         # the top-level spec — producing zero diff (everything already done)
         # and falling back to .gitignore housekeeping. Hoisted to the top
-        # and framed as the PRIMARY directive, it dominates Aider's attention.
+        # and framed as the PRIMARY directive, it dominates the builder's attention.
         issue_body = (
             f"# PRIMARY DIRECTIVE — Fix this error\n\n"
             f"This issue was previously implemented. A subsequent build or runtime "
@@ -2262,7 +2311,6 @@ async def implement_with_aider(
     llm_cfg = await orch._llm_config()
     builder_cfg = llm_cfg.get("builder", {}) or {}
     model = builder_cfg.get("model", "anthropic/claude-sonnet-4-6")
-    engine = (builder_cfg.get("engine") or "aider").strip().lower()
     # Remove internal claude/ prefix if present; keep anthropic/ for LiteLLM routing
     model = model.replace("claude/", "")
     # Validate model — fall back if it looks like a hallucinated or unrecognized name
@@ -2274,8 +2322,7 @@ async def implement_with_aider(
 
     is_reimplementation = bool(existing_pr_number)
     action = "re-implementing" if is_reimplementation else "starting"
-    engine_label = "Aider" if engine == "aider" else "Agent SDK"
-    await orch._log(f"{engine_label} {action} on #{issue_number}", issue_title, "RUNNING")
+    await orch._log(f"Agent SDK {action} on #{issue_number}", issue_title, "RUNNING")
 
     # Set "implementing" status immediately so the UI shows "Working…" while the builder runs
     from orchestrator.models.project import update_github_issue_status, list_github_issues as _list_issues
@@ -2283,59 +2330,44 @@ async def implement_with_aider(
     await emit_issues_updated(project_id, await _list_issues(project_id))
 
     # Fetch the live Supabase schema (cached on the orchestrator instance) so
-    # both engines see authoritative table/column names. Without this the
+    # the builder sees authoritative table/column names. Without this the
     # builder writes against fictional schemas — the original bug.
     schema_for_builder = await orch.get_supabase_schema()
     schema_md_for_builder: str | None = (
         schema_for_builder.markdown if schema_for_builder and schema_for_builder.ok else None
     )
 
-    if engine == "agent_sdk":
-        from orchestrator.builder.agent_sdk import implement_issue_via_agent_sdk
-        # Agent SDK takes the raw model name (no LiteLLM "anthropic/" prefix).
-        sdk_model = model.removeprefix("anthropic/")
-        branch, failure_reason, usage = await implement_issue_via_agent_sdk(
-            project_id=project_id,
-            owner=owner,
-            repo=repo,
-            issue_number=issue_number,
-            issue_title=issue_title,
-            issue_body=issue_body,
-            default_branch=default_branch,
-            model=sdk_model,
-            is_reimplementation=is_reimplementation,
-            extra_context=None,  # already prepended above for both engines
-            supabase_schema_markdown=schema_md_for_builder,
-        )
-        # Surface cost in activity log so the UI shows the cheaper engine's wins.
-        await orch._log(
-            f"Agent SDK done for #{issue_number}",
-            (
-                f"iterations={usage.iterations} • tool_calls={usage.tool_calls} • "
-                f"in={usage.input_tokens} • out={usage.output_tokens} • "
-                f"cache_r={usage.cache_read_input_tokens} • cache_w={usage.cache_creation_input_tokens} • "
-                f"~${usage.estimated_cost_usd(model):.4f}"
-            ),
-            "INFO" if branch else "AMBIGUITY",
-        )
-    else:
-        branch, failure_reason = await implement_issue(
-            project_id=project_id,
-            owner=owner,
-            repo=repo,
-            issue_number=issue_number,
-            issue_title=issue_title,
-            issue_body=issue_body,
-            default_branch=default_branch,
-            model=model,
-            is_reimplementation=is_reimplementation,
-            supabase_schema_markdown=schema_md_for_builder,
-        )
+    # Agent SDK takes the raw model name (no LiteLLM "anthropic/" prefix).
+    sdk_model = model.removeprefix("anthropic/")
+    branch, failure_reason, usage = await implement_issue_via_agent_sdk(
+        project_id=project_id,
+        owner=owner,
+        repo=repo,
+        issue_number=issue_number,
+        issue_title=issue_title,
+        issue_body=issue_body,
+        default_branch=default_branch,
+        model=sdk_model,
+        is_reimplementation=is_reimplementation,
+        extra_context=None,  # already prepended above
+        supabase_schema_markdown=schema_md_for_builder,
+    )
+    # Surface cost in the activity log.
+    await orch._log(
+        f"Agent SDK done for #{issue_number}",
+        (
+            f"iterations={usage.iterations} • tool_calls={usage.tool_calls} • "
+            f"in={usage.input_tokens} • out={usage.output_tokens} • "
+            f"cache_r={usage.cache_read_input_tokens} • cache_w={usage.cache_creation_input_tokens} • "
+            f"~${usage.estimated_cost_usd(model):.4f}"
+        ),
+        "INFO" if branch else "AMBIGUITY",
+    )
 
     if not branch:
         detail = failure_reason or "unknown error"
-        await orch._log(f"Aider #{issue_number}: implementation failed", detail, "ERROR")
-        await emit_error(project_id, f"Aider failed on #{issue_number}: {detail[:200]}")
+        await orch._log(f"Builder #{issue_number}: implementation failed", detail, "ERROR")
+        await emit_error(project_id, f"Builder failed on #{issue_number}: {detail[:200]}")
         # Revert status back to open so user can retry
         revert_status = "pr_reviewed" if is_reimplementation else "open"
         await update_github_issue_status(project_id, issue_number, revert_status)
@@ -2348,7 +2380,7 @@ async def implement_with_aider(
     if existing_pr_number:
         existing_pr = await orch.gh.find_pr_for_issue(owner, repo, issue_number)
         pr_url = existing_pr["html_url"] if existing_pr else (local_issue or {}).get("pr_url") or ""
-        await orch._log(f"Aider #{issue_number}: pushed update to existing PR #{existing_pr_number}", f"PR #{existing_pr_number}", "SUCCESS")
+        await orch._log(f"Builder #{issue_number}: pushed update to existing PR #{existing_pr_number}", f"PR #{existing_pr_number}", "SUCCESS")
         await update_github_issue_pr(project_id, issue_number, existing_pr_number, pr_url, status="pr_open", pr_review=None)
         updated_issues = await list_github_issues(project_id)
         await emit_issues_updated(project_id, updated_issues)
@@ -2356,7 +2388,7 @@ async def implement_with_aider(
 
     # Open a new PR
     pr_title = f"fix: implement #{issue_number} {issue_title}"
-    pr_body = f"Closes #{issue_number}\n\nImplemented by Aider + Claude ({model})."
+    pr_body = f"Closes #{issue_number}\n\nImplemented by the Automatron Agent SDK builder ({model})."
     try:
         pr = await orch.gh.create_pull_request(
             owner, repo,
@@ -2367,14 +2399,14 @@ async def implement_with_aider(
         )
         pr_number = pr["number"]
         pr_url = pr["html_url"]
-        await orch._log(f"Aider #{issue_number}: PR opened", f"PR #{pr_number}", "SUCCESS")
+        await orch._log(f"Builder #{issue_number}: PR opened", f"PR #{pr_number}", "SUCCESS")
 
         await update_github_issue_pr(project_id, issue_number, pr_number, pr_url, status="pr_open")
         updated_issues = await list_github_issues(project_id)
         await emit_issues_updated(project_id, updated_issues)
     except Exception as exc:
-        await orch._log(f"Aider #{issue_number}: PR creation failed", str(exc), "ERROR")
-        await emit_error(project_id, f"Aider: PR failed for #{issue_number}: {exc}")
+        await orch._log(f"Builder #{issue_number}: PR creation failed", str(exc), "ERROR")
+        await emit_error(project_id, f"Builder: PR failed for #{issue_number}: {exc}")
 
 
 async def create_issue_from_prompt(project_id: str, prompt: str) -> None:

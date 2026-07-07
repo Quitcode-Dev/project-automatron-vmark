@@ -32,7 +32,7 @@ export interface StackConfig {
 export type LlmProvider = "openai" | "anthropic" | "google";
 export type DeployAuthMode = "ssh_key" | "password";
 
-export type BuilderEngine = "aider" | "agent_sdk";
+export type BuilderEngine = "agent_sdk";
 
 export interface LlmRoleConfig {
   provider: LlmProvider;
@@ -40,9 +40,9 @@ export interface LlmRoleConfig {
 }
 
 export interface BuilderRoleConfig extends LlmRoleConfig {
-  /** Which builder engine drives this project's implementation runs.
-   *  "aider" (default) = current production path. "agent_sdk" = experimental
-   *  Anthropic tool-use loop with prompt caching. See orchestrator/builder/. */
+  /** Builder engine driving this project's implementation runs. The only
+   *  supported value is "agent_sdk" (Anthropic tool-use loop with prompt
+   *  caching). See orchestrator/builder/. */
   engine?: BuilderEngine;
 }
 

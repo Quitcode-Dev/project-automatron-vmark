@@ -38,11 +38,14 @@ class Settings(BaseSettings):
     architect_prompt_version: str = "v1"
 
     # --- Builder ---
-    # Defaults to Sonnet (~5× cheaper than Opus) because Aider's diff-format
-    # quality on Sonnet is nearly indistinguishable for the patch-style edits
-    # Aider does. Override per-project via llm_config if a task truly needs
+    # Defaults to Sonnet (~5× cheaper than Opus); its tool-use edit quality is
+    # nearly indistinguishable from Opus for the patch-style edits the Agent SDK
+    # builder makes. Override per-project via llm_config if a task truly needs
     # Opus-level reasoning.
     builder_model: str = "anthropic/claude-sonnet-4-6"
+    # Deprecated/unused: the Aider builder (which honoured this) was removed. Kept
+    # so deployments whose .env still sets BUILDER_CLINE_TIMEOUT don't trip the
+    # extra_forbidden validation on startup. Safe to drop once no .env sets it.
     builder_cline_timeout: int = 900
     # Reviewer reads PR diffs and emits a short structured summary — Sonnet
     # is more than enough.
@@ -53,6 +56,20 @@ class Settings(BaseSettings):
     workspace_base_path: str = "/var/automatron/workspaces"
     port_range_start: int = 7000
     port_range_end: int = 7999
+
+    # --- Preview exposure ---
+    # When preview_base_domain is set, preview containers are published through
+    # Traefik as HTTPS subdomains (https://<slug>.<preview_base_domain>) instead
+    # of http://<host>:<port>. The raw-port form is unreachable behind the TLS
+    # reverse proxy AND blocked as mixed content inside the HTTPS app, so it must
+    # be set in any deployment that runs behind Traefik. Requires wildcard DNS
+    # (*.<preview_base_domain> → this host) so Traefik's cert resolver can issue
+    # a cert per preview host. Leave empty for local dev (falls back to
+    # http://localhost:<port>).
+    preview_base_domain: str = ""
+    preview_traefik_network: str = "proxy"
+    preview_traefik_certresolver: str = "le"
+    preview_traefik_entrypoint: str = "websecure"
 
     # --- Deploy ---
     deploy_ssh_key_path: str = ""

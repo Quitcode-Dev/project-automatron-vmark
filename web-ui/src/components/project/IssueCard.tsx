@@ -12,7 +12,7 @@ interface IssueCardProps {
   issue: GithubIssue;
   onReview: (issueNumber: number, prNumber: number) => void;
   onAssignCopilot: (issueNumber: number) => void;
-  onImplementAider: (issueNumber: number) => void;
+  onImplement: (issueNumber: number) => void;
   onPreviewBranch?: (issueNumber: number) => void;
   isReviewing: boolean;
   isAssigning: boolean;
@@ -63,7 +63,7 @@ function timeAgo(iso: string): string {
   return `${Math.floor(diff / 86400)}d ago`;
 }
 
-export function IssueCard({ issue, onReview, onAssignCopilot, onImplementAider, onPreviewBranch, isReviewing, isAssigning, isImplementing, isPreviewing }: IssueCardProps) {
+export function IssueCard({ issue, onReview, onAssignCopilot, onImplement, onPreviewBranch, isReviewing, isAssigning, isImplementing, isPreviewing }: IssueCardProps) {
   const [reviewExpanded, setReviewExpanded] = useState(false);
   const vs = toVisualState(issue);
   const meta = STATE_META[vs];
@@ -137,7 +137,7 @@ export function IssueCard({ issue, onReview, onAssignCopilot, onImplementAider, 
               </span>
             )}
 
-            {/* Working — Aider running (persisted via DB status) */}
+            {/* Working — builder running (persisted via DB status) */}
             {vs === "implementing" && (
               <span className="inline-flex items-center gap-1.5 text-xs text-violet-400">
                 <Loader2 className="h-3 w-3 animate-spin" /> Working…
@@ -153,9 +153,9 @@ export function IssueCard({ issue, onReview, onAssignCopilot, onImplementAider, 
               </button>
             )}
 
-            {/* Implement with Aider — open, no PR */}
+            {/* Implement with the builder — open, no PR */}
             {vs === "open" && (
-              <button onClick={() => onImplementAider(issue.issue_number)} disabled={isImplementing || isAssigning}
+              <button onClick={() => onImplement(issue.issue_number)} disabled={isImplementing || isAssigning}
                 className="inline-flex items-center gap-1.5 rounded-md border border-violet-500/40 bg-violet-500/5 px-2 py-1 text-xs font-medium text-violet-400 hover:bg-violet-500/10 transition-colors disabled:opacity-50">
                 {isImplementing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Bot className="h-3 w-3" />}
                 {isImplementing ? "Working…" : "Implement"}
@@ -171,16 +171,16 @@ export function IssueCard({ issue, onReview, onAssignCopilot, onImplementAider, 
               </button>
             )}
 
-            {/* Re-implement with Aider after review failure */}
+            {/* Re-implement with the builder after review failure */}
             {vs === "pr_reviewed_fail" && (
-              <button onClick={() => onImplementAider(issue.issue_number)} disabled={isImplementing || isReviewing}
+              <button onClick={() => onImplement(issue.issue_number)} disabled={isImplementing || isReviewing}
                 className="inline-flex items-center gap-1.5 rounded-md border border-violet-500/40 bg-violet-500/5 px-2 py-1 text-xs font-medium text-violet-400 hover:bg-violet-500/10 transition-colors disabled:opacity-50">
                 {isImplementing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Bot className="h-3 w-3" />}
                 {isImplementing ? "Working…" : "Re-implement"}
               </button>
             )}
 
-            {/* Preview this branch — available any time there's an Aider PR (open or reviewed),
+            {/* Preview this branch — available any time there's a builder PR (open or reviewed),
                 lets you see the in-flight implementation without merging it to main. */}
             {onPreviewBranch && (vs === "pr_open" || vs === "pr_reviewed_fail" || vs === "pr_reviewed_pass") && (
               <button onClick={() => onPreviewBranch(issue.issue_number)} disabled={isPreviewing}

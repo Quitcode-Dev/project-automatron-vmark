@@ -42,10 +42,12 @@ from orchestrator.orchestrator import (
     assign_to_copilot as orch_assign_copilot,
     assign_to_copilot_issue as orch_assign_copilot_issue,
     audit_project as orch_audit_project,
+    cancel_project_task as orch_cancel_task,
     create_issue_from_prompt as orch_create_issue_from_prompt,
-    implement_with_aider as orch_implement_aider,
+    implement_issue_with_builder as orch_implement_issue,
     resume_project as orch_resume,
     review_pr as orch_review_pr,
+    run_tracked as orch_run_tracked,
     start_project as orch_start,
     sync_issues as orch_sync_issues,
 )
@@ -63,8 +65,8 @@ class RoleLlmConfig(BaseModel):
 
 
 class BuilderRoleLlmConfig(RoleLlmConfig):
-    # "aider" (default) or "agent_sdk". normalize_llm_config falls back to
-    # the default if missing or invalid, so this is permissive on input.
+    # Builder engine. Only "agent_sdk" is supported; normalize_llm_config coerces
+    # anything else (including legacy "aider") to it, so this is permissive on input.
     engine: str | None = None
 
 
@@ -374,16 +376,16 @@ async def api_assign_copilot_issue(project_id: str, issue_number: int) -> dict:
 
 
 @router.post("/projects/{project_id}/issues/{issue_number}/implement")
-async def api_implement_aider(
+async def api_implement_issue(
     project_id: str, issue_number: int, background_tasks: BackgroundTasks
 ) -> dict[str, str]:
     await _get_required_project(project_id)
-    background_tasks.add_task(orch_implement_aider, project_id, issue_number)
+    background_tasks.add_task(orch_implement_issue, project_id, issue_number)
     return {"status": "started", "issue_number": str(issue_number)}
 
 
 class ReimplementWithContextRequest(BaseModel):
-    context: str = Field(..., description="The error context to feed back to Aider")
+    context: str = Field(..., description="The error context to feed back to the builder")
 
 
 @router.post("/projects/{project_id}/issues/{issue_number}/reimplement-with-context")
@@ -391,14 +393,14 @@ async def api_reimplement_with_context(
     project_id: str, issue_number: int,
     req: ReimplementWithContextRequest, background_tasks: BackgroundTasks,
 ) -> dict[str, str]:
-    """Re-run Aider on an existing issue with extra context appended to the spec.
+    """Re-run the builder on an existing issue with extra context appended to the spec.
 
-    Used by the "Send to Aider" button on ERROR-level activity rows: the row's
+    Used by the "Retry with context" button on ERROR-level activity rows: the row's
     title + body + error_detail is bundled and fed back as a fix directive.
     """
     await _get_required_project(project_id)
     background_tasks.add_task(
-        orch_implement_aider, project_id, issue_number, req.context,
+        orch_implement_issue, project_id, issue_number, req.context,
     )
     return {"status": "started", "issue_number": str(issue_number)}
 
@@ -451,7 +453,8 @@ async def api_start_project(project_id: str, background_tasks: BackgroundTasks) 
     # Run preflight (LLM config check only in GitHub-native mode)
     result = await preflight_service.run("start", project=project)
     _raise_for_preflight_failure(result)
-    background_tasks.add_task(orch_start, project_id)
+    # Tracked (cancellable) so POST /stop can actually interrupt planning/building.
+    orch_run_tracked(project_id, orch_start(project_id))
     return {"status": "started", "project_id": project_id}
 
 
@@ -460,7 +463,8 @@ async def api_approve_plan(
     project_id: str, background_tasks: BackgroundTasks, req: ApproveRequest | None = None
 ) -> dict[str, str]:
     await _get_required_project(project_id)
-    background_tasks.add_task(orch_resume, project_id, "plan", True)
+    # Tracked (cancellable) so POST /stop can interrupt the build (apply_plan).
+    orch_run_tracked(project_id, orch_resume(project_id, "plan", True))
     return {"status": "resuming", "project_id": project_id}
 
 
@@ -473,10 +477,16 @@ async def api_approve_project(
 
 @router.post("/projects/{project_id}/stop")
 async def api_stop_project(project_id: str) -> dict[str, str]:
-    await _get_required_project(project_id)
-    await update_project_status(project_id, "stopped")
-    await update_project_stage(project_id, "stopped")
-    return {"status": "stopped", "project_id": project_id}
+    project = await _get_required_project(project_id)
+    # Actually interrupt the running orchestration (not just relabel the DB).
+    cancelled = orch_cancel_task(project_id)
+    # "paused" (not "stopped") so the UI's Resume button shows and the project
+    # isn't wedged; keep the last real stage for the tracker.
+    await update_project_status(project_id, "paused")
+    stage = project.get("project_stage") or "intake"
+    from orchestrator.api.websocket import emit_status_update
+    await emit_status_update(project_id, status="paused", stage=stage, progress={})
+    return {"status": "paused", "cancelled": str(cancelled).lower(), "project_id": project_id}
 
 
 @router.put("/projects/{project_id}/deploy-target")
@@ -622,18 +632,18 @@ async def _run_preview_and_save(
 async def api_preview_issue_branch(
     project_id: str, issue_number: int, background_tasks: BackgroundTasks,
 ) -> dict[str, str]:
-    """Spin up a preview against the Aider PR branch for this issue, so the user
-    can see the implementation before merging."""
+    """Spin up a preview against the builder's PR branch for this issue, so the
+    user can see the implementation before merging."""
     project = await _get_required_project(project_id)
     owner = project.get("github_repo_owner") or ""
     repo = project.get("github_repo_name") or ""
     if not owner or not repo:
         raise HTTPException(status_code=422, detail="Project has no GitHub repo configured")
     default_branch = project.get("default_branch") or "main"
-    # The Aider workflow always pushes to branch `aider/fix-<issue_number>`. We
+    # The builder always pushes to branch `agent-sdk/fix-<issue_number>`. We
     # don't bother resolving via the PR number because the branch naming is
     # deterministic — and the issue may not even have a PR recorded yet locally.
-    branch = f"aider/fix-{issue_number}"
+    branch = f"agent-sdk/fix-{issue_number}"
     background_tasks.add_task(
         _run_preview_and_save, project_id, owner, repo, default_branch, branch, issue_number,
     )

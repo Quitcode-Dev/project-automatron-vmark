@@ -17,7 +17,7 @@ interface IssuesBoardProps {
   onStartPreview: () => Promise<void> | void;
   onReview: (issueNumber: number, prNumber: number) => void;
   onAssignCopilot: (issueNumber: number) => void;
-  onImplementAider: (issueNumber: number) => void;
+  onImplement: (issueNumber: number) => void;
   onPreviewBranch: (issueNumber: number) => void;
   onCreateIssue: (prompt: string) => void;
   onBuildCheck: () => void;
@@ -38,7 +38,7 @@ interface IssuesBoardProps {
 
 export function IssuesBoard({
   issues, repoUrl, previewUrl, onSync, onAudit, onStartPreview, onReview, onAssignCopilot,
-  onImplementAider, onPreviewBranch, onCreateIssue, onBuildCheck,
+  onImplement, onPreviewBranch, onCreateIssue, onBuildCheck,
   reviewingIssues, assigningIssues, implementingIssues, previewingIssues,
   isSyncing, isAuditing, isCreatingIssue, isCheckingBuild,
   buildFailure, onCreateBuildIssue, onDismissBuildFailure,
@@ -346,7 +346,7 @@ export function IssuesBoard({
                       issue={issue}
                       onReview={onReview}
                       onAssignCopilot={onAssignCopilot}
-                      onImplementAider={onImplementAider}
+                      onImplement={onImplement}
                       onPreviewBranch={onPreviewBranch}
                       isReviewing={reviewingIssues.has(issue.issue_number)}
                       isAssigning={assigningIssues.has(issue.issue_number)}

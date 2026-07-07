@@ -1,7 +1,7 @@
 """Redact secrets from text before logging.
 
 Anything that gets passed to `logger.info`/`logger.error` that includes the
-output of git, npm, docker, or Aider should be run through `redact()` first.
+output of git, npm, docker, or the builder should be run through `redact()` first.
 External command output is the most common path for tokens to leak into logs.
 """
 from __future__ import annotations

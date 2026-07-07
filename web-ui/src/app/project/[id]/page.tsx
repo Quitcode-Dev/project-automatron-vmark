@@ -122,13 +122,12 @@ export default function ProjectPage() {
     stopProject,
     approvePlan,
     approvePreview,
-    deployProject,
     syncIssues,
     auditProject,
     restartPreview,
     triggerPRReview,
     assignIssueToCopilot,
-    implementWithAider,
+    implementIssue,
     previewIssueBranch,
     createIssueFromPrompt,
     updateDeployTarget,
@@ -276,10 +275,10 @@ export default function ProjectPage() {
     }
   };
 
-  const handleImplementAider = async (issueNumber: number) => {
+  const handleImplement = async (issueNumber: number) => {
     setImplementingIssues((prev) => new Set(prev).add(issueNumber));
     try {
-      await implementWithAider(projectId, issueNumber);
+      await implementIssue(projectId, issueNumber);
     } finally {
       setImplementingIssues((prev) => {
         const next = new Set(prev);
@@ -379,11 +378,7 @@ export default function ProjectPage() {
     ["pending", "paused", "error"].includes(currentProject.status);
   const canApprovePlan =
     currentProject?.project_stage === "awaiting_plan_approval";
-  const canApprovePreview =
-    currentProject?.project_stage === "awaiting_preview_approval";
-  const canDeploy = currentProject?.project_stage === "ready_for_deploy";
   const isDeployed = currentProject?.project_stage === "deployed";
-  const deployConfigured = Boolean(currentProject?.deploy_target_summary?.host);
   const canRestartPreview =
     Boolean(currentProject?.container_id || currentProject?.preview_url) &&
     (currentProject?.status === "preview" ||
@@ -504,26 +499,6 @@ export default function ProjectPage() {
             </button>
           )}
 
-          {canApprovePreview && (
-            <button
-              onClick={() => void approvePreview(projectId)}
-              className="flex items-center gap-2 rounded-lg bg-cyan-600 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-700"
-            >
-              <CheckCircle2 className="h-4 w-4" />
-              Approve Preview
-            </button>
-          )}
-
-          {canDeploy && (
-            <button
-              onClick={() => void deployProject(projectId)}
-              disabled={!deployConfigured}
-              className="flex items-center gap-2 rounded-lg bg-violet-600 px-4 py-2 text-sm font-medium text-white hover:bg-violet-700 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              <Rocket className="h-4 w-4" />
-              Deploy
-            </button>
-          )}
 
           {canStart && (
             <button
@@ -711,39 +686,6 @@ export default function ProjectPage() {
                         )}
                       </label>
                     </div>
-
-                    {role === "builder" && (
-                      <div className="grid gap-3 md:grid-cols-[96px_1fr_1.2fr]">
-                        <div />
-                        <label className="space-y-1 text-sm md:col-span-2">
-                          <span className="text-muted-foreground">Engine</span>
-                          <select
-                            value={llmConfig.builder.engine ?? "aider"}
-                            disabled={isRunning}
-                            onChange={(event) =>
-                              setLlmConfig((current) => ({
-                                ...current,
-                                builder: {
-                                  ...current.builder,
-                                  engine: event.target.value as "aider" | "agent_sdk",
-                                },
-                              }))
-                            }
-                            className="w-full rounded-lg border border-input bg-background px-3 py-2 text-sm"
-                          >
-                            <option value="aider">Aider (subprocess, default)</option>
-                            <option value="agent_sdk">
-                              Agent SDK (Anthropic tool-loop — experimental, ~5× cheaper)
-                            </option>
-                          </select>
-                          <p className="text-xs text-muted-foreground">
-                            Anthropic Agent SDK uses prompt caching and tool-use for
-                            cheaper, cleaner runs. Push goes to <code>agent-sdk/fix-N</code>{" "}
-                            instead of <code>aider/fix-N</code>. Anthropic models only.
-                          </p>
-                        </label>
-                      </div>
-                    )}
                   </div>
                 ))}
               </div>
@@ -956,7 +898,7 @@ export default function ProjectPage() {
               onStartPreview={() => restartPreview(projectId)}
               onReview={(issueNumber, prNumber) => void handleReviewPR(issueNumber, prNumber)}
               onAssignCopilot={(issueNumber) => void handleAssignCopilot(issueNumber)}
-              onImplementAider={(issueNumber) => void handleImplementAider(issueNumber)}
+              onImplement={(issueNumber) => void handleImplement(issueNumber)}
               onPreviewBranch={(issueNumber) => void handlePreviewBranch(issueNumber)}
               onCreateIssue={(prompt) => void handleCreateIssue(prompt)}
               onBuildCheck={() => void handleBuildCheck()}

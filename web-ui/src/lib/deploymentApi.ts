@@ -3,7 +3,11 @@
  * These wrap the 14 endpoints added in docker_deployment_ai.
  */
 
-const BASE = "/api";
+// Absolute backend base (same as api.ts). Using a relative "/api" only works
+// when the UI and API share an origin (prod behind Traefik) and 404s in local
+// dev where the UI is on :3000 and the API on :8000.
+const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const BASE = `${API_URL}/api`;
 
 async function request<T = unknown>(
   path: string,
@@ -11,7 +15,7 @@ async function request<T = unknown>(
 ): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { "Content-Type": "application/json", ...(options.headers ?? {}) },
-    credentials: "same-origin",
+    credentials: "include", // send Auth.js session cookie (deploy endpoints require auth)
     ...options,
   });
   if (!res.ok) {

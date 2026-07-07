@@ -2,8 +2,8 @@
 
 Pre-architect step that pushes a buildable framework skeleton to a target repo's
 `main` branch *before* the architect plans any issues. Eliminates the
-recurring failure mode where Aider's first issue assumes `package.json` and
-friends already exist (because the architect's spec assumed it too).
+recurring failure mode where the builder's first issue assumes `package.json`
+and friends already exist (because the architect's spec assumed it too).
 
 See plan: /Users/qc3/.claude/plans/atomic-fluttering-duckling.md
 """

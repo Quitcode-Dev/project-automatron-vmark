@@ -1,6 +1,7 @@
-"""Pluggable builder engines.
+"""Builder engine.
 
-Today: Aider (subprocess). Experimental: Anthropic Agent SDK (tool-use loop).
-Selectable per-project via llm_config['builder']['engine'] = 'aider' | 'agent_sdk'.
-The A/B harness in `scripts/compare_builders.py` runs both on the same issue.
+The sole engine is the Anthropic Agent SDK tool-use loop
+(`agent_sdk.implement_issue_via_agent_sdk`). The per-project
+llm_config['builder']['engine'] field is retained for forward-compat but only
+'agent_sdk' is supported.
 """
