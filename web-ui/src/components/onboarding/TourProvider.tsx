@@ -53,10 +53,25 @@ export function TourProvider() {
     driverRef.current?.destroy();
     const d = driver({
       showProgress: true,
-      allowClose: true,
+      // Don't dismiss on overlay/tab/esc — the tour drives the tabs itself, so
+      // an accidental click shouldn't kill it. Intentional exit is the injected
+      // "Skip tour" button (below) or Done on the last step.
+      allowClose: false,
+      showButtons: ["next", "previous"],
       nextBtnText: "Next",
       prevBtnText: "Back",
       doneBtnText: "Done",
+      // driver.js hides its ✕ when allowClose is false, so add our own exit.
+      onPopoverRender: (popover) => {
+        const skip = document.createElement("button");
+        skip.type = "button";
+        skip.textContent = "Skip tour";
+        skip.className = "driver-popover-footer-btn";
+        skip.style.marginRight = "auto";
+        skip.style.opacity = "0.7";
+        skip.addEventListener("click", () => driverRef.current?.destroy());
+        popover.footerButtons.prepend(skip);
+      },
       // Map our steps to driver's shape. `onNext` lets a step run a side-effect
       // (e.g. open the New Project modal) and advance once the DOM is ready.
       // Only attach onNextClick when onNext exists — leaving the key present
