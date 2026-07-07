@@ -1,192 +1,141 @@
 # Deployment Guide — Project Automatron
 
+Production runs at **https://automatron.quitcode.com** and deploys automatically
+from `origin/main` via GitHub Actions.
+
 ## Prerequisites
 
-- **OS**: Ubuntu 22.04+ / Debian 12+ (Linux VPS)
-- **Docker**: 24.0+ with Docker Compose v2
-- **RAM**: 4 GB minimum (8 GB recommended)
-- **Disk**: 20 GB minimum
-- **Ports**: 80 (nginx), 8000 (API), 3000 (UI), 7000-7999 (project previews)
+- **OS:** Linux host with Docker Engine 24.0+ and Docker Compose v2.
+- **Reverse proxy:** [Traefik](https://traefik.io) attached to an external Docker
+  network named `proxy` (TLS via Let's Encrypt, cert resolver `le`). The base
+  `docker-compose.yml` also ships an `nginx` service, but the production overlay
+  disables it in favour of Traefik.
+- **Ports:** 8000 (API/WS), 3000 (UI). Both are exposed to Traefik over the
+  `proxy` network rather than published directly in production.
+- API keys and GitHub credentials (see Environment variables below).
 
-## Quick Start (Development)
-
-### 1. Clone & configure
-
-```bash
-git clone <repo-url> automatron
-cd automatron
-
-# Create secrets
-make secrets
-# Edit secrets with real API keys:
-nano secrets/openai_api_key.txt
-nano secrets/anthropic_api_key.txt
-
-# Copy env template
-cp .env.example .env
-# Edit with your preferred models/settings
-nano .env
-```
-
-### 2. Build Golden Image
+## Local development
 
 ```bash
-make golden
-```
+cp .env.example .env        # fill in the values (see below)
 
-This builds the `automatron/golden:latest` Docker image with Ubuntu 24.04,
-Node.js 22, Python 3.12, and Cline CLI pre-installed.
-
-### 3. Run in development mode
-
-**Option A: Docker Compose (recommended)**
-
-```bash
-make build
-make up
-```
-
-- API: http://localhost:8000
-- UI: http://localhost:3000
-- Logs: `make logs`
-
-**Option B: Local development (hot-reload)**
-
-```bash
-# Terminal 1: Backend
+# Backend — port 8000
 cd orchestrator
 pip install -e ".[dev]"
-uvicorn orchestrator.main:combined_app --reload --host 0.0.0.0 --port 8000
+uvicorn orchestrator.main:app --reload --host 0.0.0.0 --port 8000   # or: make dev
 
-# Terminal 2: Frontend
+# Frontend — port 3000 (npm)
 cd web-ui
-pnpm install
-pnpm dev
+npm install
+npm run dev
 ```
 
-### 4. Run tests
+Set `AUTOMATRON_DEV_NO_AUTH=true` to bypass Google OAuth locally.
+
+### Run the full stack in Docker (dev)
 
 ```bash
-make test
+docker compose up -d --build     # or: make build && make up
+docker compose logs -f           # or: make logs
 ```
 
-## Production Deployment
+## Production deployment (automated)
 
-### 1. Build and start with nginx
+`.github/workflows/deploy.yml` runs on every push to `main` (and via
+`workflow_dispatch`). It:
 
-```bash
-# Build all images
-make golden
-docker compose build
+1. Validates the `AUTOMATRON_DEPLOY_KEY` secret and configures SSH.
+2. SSHes into the production host and, in `/root/app/automatron-vmark`, fetches
+   and **hard-resets** to `origin/main` (preserving the server's `.env`).
+3. Rebuilds and restarts containers:
+   ```bash
+   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --build --remove-orphans
+   ```
+4. Posts a status webhook notification.
 
-# Start with nginx reverse proxy
-docker compose --profile production up -d
-```
+The overlay wires both services into Traefik on `automatron.quitcode.com`:
 
-The nginx profile adds a reverse proxy on port 80 that routes:
-- `/api/*` → orchestrator:8000
-- `/socket.io/*` → orchestrator:8000 (WebSocket)
-- `/*` → web-ui:3000
+- `/api/*`, `/health`, `/socket.io/*` → `orchestrator:8000`
+- `/api/auth/*` → `web-ui:3000` (Auth.js routes live in Next.js, higher priority)
+- everything else → `web-ui:3000`
 
-### 2. Environment variables
+### Required GitHub Actions secrets
 
-All configuration is via environment variables (see `.env.example`):
+| Secret | Purpose |
+|--------|---------|
+| `AUTOMATRON_DEPLOY_KEY` | SSH private key for the deploy user on the host |
+| `AUTOMATRON_WEBHOOK_URL` | Optional — deploy status notification endpoint |
+
+The host also needs `/root/.ssh/automatron_deploy` (a key with read access to the
+repo) so it can `git fetch` over SSH.
+
+## Environment variables
+
+Configuration is loaded from `.env` (see `.env.example`). `pydantic-settings`
+reads it from the current working directory. Key variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `OPENAI_API_KEY` | — | OpenAI API key |
-| `ANTHROPIC_API_KEY` | — | Anthropic API key |
-| `GOOGLE_API_KEY` | — | Google AI API key |
-| `ARCHITECT_MODEL` | `anthropic/claude-sonnet-4-20250514` | LLM for planning |
-| `BUILDER_MODEL` | `anthropic/claude-sonnet-4-20250514` | LLM for Cline |
-| `REVIEWER_MODEL` | `openai/gpt-4.1-mini` | LLM for status classification |
-| `SQLITE_DB_PATH` | `./data/automatron.db` | Project database path |
-| `CHECKPOINT_DB_PATH` | `./data/checkpoints.db` | LangGraph checkpoint DB |
-| `GOLDEN_IMAGE` | `automatron/golden:latest` | Docker image for builders |
-| `WORKSPACE_BASE_PATH` | `/var/automatron/workspaces` | Volume mount base |
-| `PORT_RANGE_START` | `7000` | Preview port range start |
-| `PORT_RANGE_END` | `7999` | Preview port range end |
-| `CONTAINER_MEMORY_LIMIT` | `2g` | RAM limit per container |
-| `CONTAINER_CPU_LIMIT` | `2.0` | CPU limit per container |
-| `CLINE_TIMEOUT` | `300` | Cline CLI timeout (seconds) |
-| `MAX_ESCALATIONS` | `2` | Max re-plan attempts per task |
+| `GITHUB_TOKEN` | — | GitHub PAT for repo/issue/PR automation |
+| `GITHUB_OWNER` / `GITHUB_OWNER_TYPE` | — / `user` | Target owner and whether it's a `user` or `org` |
+| `GITHUB_WEBHOOK_SECRET` | — | HMAC secret verifying inbound GitHub webhooks |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` / `GOOGLE_API_KEY` | — | LLM providers (via LiteLLM) |
+| `ARCHITECT_MODEL` | `anthropic/claude-opus-4-6` | Planning model |
+| `BUILDER_MODEL` | `anthropic/claude-sonnet-4-6` | Agent SDK builder model |
+| `REVIEWER_MODEL` | `anthropic/claude-sonnet-4-6` | PR review model |
+| `SQLITE_DB_PATH` | `./data/automatron.db` | Application database |
+| `AUTH_SECRET` | — | Shared JWT secret (also used by web-ui NextAuth) |
+| `AUTH_URL` | — | Public URL for NextAuth (e.g. the production URL) |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | — | Google OAuth 2.0 web client |
+| `AUTOMATRON_ALLOWED_EMAILS` | — | Sign-in allowlist (`dev@x.com` or `@x.com` domain rules) |
+| `AUTOMATRON_DEV_NO_AUTH` | `false` | Local escape hatch — **never** set in production |
+| `AUTOMATRON_PUBLIC_URL` | — | Public URL; used to auto-register GitHub webhooks |
+| `DOCKER_AI_PROVIDER_PRIORITY` | `gordon,docker_agent,model_runner,litellm` | Deployment-AI backend chain (first available wins) |
+| `DOCKER_AI_MODEL` | `gpt-5.3-codex` | Model for the DevOps/deployment agent |
+| `PORT_RANGE_START` / `PORT_RANGE_END` | `7000` / `7999` | Local preview port range |
 
-### 3. Docker Secrets (recommended for production)
+> `gpt-5*` models require `temperature=1`; the LLM provider sets this automatically.
 
-API keys are read from Docker Secrets at `/run/secrets/`:
+## Data persistence
 
-```bash
-# Create secret files (already done by `make secrets`)
-echo "sk-real-key-here" > secrets/openai_api_key.txt
-echo "sk-ant-real-key" > secrets/anthropic_api_key.txt
-echo "AI-real-key" > secrets/google_api_key.txt
-```
+- `orchestrator/data/` — SQLite databases. Back up by copying the directory.
+- The server's `.env` is preserved across deploys (never checked into git).
 
-The orchestrator's `SecretsManager` reads these automatically at startup.
+## Monitoring
 
-### 4. Data persistence
+- Health endpoint: `GET /health` → `{"status": "ok"}` (also used by the compose
+  healthcheck).
+- Logs: `docker compose logs -f orchestrator` (or `make logs-api` / `make logs-ui`).
 
-- `./data/`: SQLite databases (project DB + LangGraph checkpoints)
-- `/var/automatron/workspaces/`: Project workspace volumes (one per project)
-
-**Backup**: Simply copy the `./data/` directory. SQLite WAL mode ensures safe copying.
-
-### 5. Monitoring
-
-- Health endpoint: `GET /health` → `{"status": "ok"}`
-- Docker healthcheck: built into orchestrator Dockerfile (30s interval)
-- Logs: `docker compose logs -f orchestrator`
-
-## Makefile Commands Reference
+## Makefile reference
 
 | Command | Description |
 |---------|-------------|
-| `make help` | Show all available commands |
-| `make dev` | Run orchestrator with hot-reload |
-| `make dev-ui` | Run Next.js with hot-reload |
-| `make golden` | Build the Golden Image |
-| `make build` | Build all Docker images |
-| `make up` | Start all services |
-| `make down` | Stop all services |
-| `make logs` | Tail all service logs |
-| `make test` | Run all tests |
-| `make test-cov` | Run tests with coverage |
-| `make lint` | Lint Python code |
-| `make format` | Format Python code |
-| `make secrets` | Create secrets directory with placeholders |
-| `make clean` | Remove build artifacts |
-| `make clean-docker` | Remove containers and images |
-| `make install` | Install Python dependencies locally |
-| `make install-ui` | Install frontend dependencies locally |
+| `make dev` / `make dev-ui` | Run orchestrator / Next.js with hot-reload |
+| `make build` / `make up` / `make down` | Build / start / stop the Docker stack |
+| `make logs` / `make logs-api` / `make logs-ui` | Tail logs |
+| `make test` / `make test-cov` | Run tests (with coverage) |
+| `make lint` / `make format` / `make typecheck` | ruff lint / ruff format / mypy |
+| `make install` / `make install-ui` | Install backend / frontend deps |
+| `make clean` / `make clean-docker` | Remove build artifacts / containers & images |
+
+> The `make golden` / `make secrets` targets belong to the removed Docker-builder
+> design and are not part of the current deployment path.
 
 ## Troubleshooting
 
-### Container can't access Docker socket
-
+### "Nothing happens" after starting a project
+FastAPI `BackgroundTasks` swallows exceptions silently. Inspect the SQLite
+`activity_logs` and `trace_events` tables:
 ```bash
-# Add your user to docker group
-sudo usermod -aG docker $USER
-# OR adjust socket permissions
-sudo chmod 666 /var/run/docker.sock
+sqlite3 orchestrator/data/automatron.db "SELECT created_at, status, task_text FROM activity_logs ORDER BY seq DESC LIMIT 20;"
 ```
 
-### Port already in use
+### Webhook not firing
+Confirm `GITHUB_WEBHOOK_SECRET` matches the webhook config and that
+`AUTOMATRON_PUBLIC_URL` is reachable. Deliveries are deduped in
+`webhook_deliveries`.
 
-Check allocated ports in the SQLite DB:
-```bash
-sqlite3 data/automatron.db "SELECT * FROM port_allocations;"
-```
-
-### Cline CLI timeout
-
-Increase `CLINE_TIMEOUT` in `.env` or pass `--timeout` directly.
-Default is 300 seconds (5 minutes) per task.
-
-### LangGraph checkpoint corruption
-
-Delete the checkpoint DB and restart:
-```bash
-rm data/checkpoints.db
-make down && make up
-```
-Note: This loses all checkpoint history and paused/frozen project states.
+### Preview container issues
+The local preview runner uses the Docker Python SDK. Ensure the Docker socket is
+accessible and that ports `7000–7999` are free.
