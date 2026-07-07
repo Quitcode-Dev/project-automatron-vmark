@@ -40,6 +40,7 @@ export function useWebSocket(projectId?: string) {
     fetchChatHistory,
     fetchLogs,
     fetchPlan,
+    fetchProject,
   } = useProjectStore();
 
   useEffect(() => {
@@ -53,6 +54,7 @@ export function useWebSocket(projectId?: string) {
         // disconnected — issues, chat, activity log, plan. Fire-and-forget;
         // store actions handle their own errors.
         api.getIssues(projectId).then(setIssues).catch(() => {});
+        void fetchProject(projectId);
         void fetchChatHistory(projectId);
         void fetchLogs(projectId);
         void fetchPlan(projectId);
@@ -193,23 +195,6 @@ export function useWebSocket(projectId?: string) {
       }
     );
 
-    socket.on(
-      "aider:needs_help",
-      (data: { project_id: string; issue_number: number; error_summary: string }) => {
-        if (projectId && data.project_id !== projectId) return;
-        const log: BuilderLog = {
-          project_id: data.project_id,
-          task_index: -1,
-          task_text: `Aider needs help on #${data.issue_number}`,
-          status: "ERROR",
-          output: `Pre-push build failed on this PR but main is clean. Aider's branch was NOT pushed.\n\n${data.error_summary}`,
-          error_detail: data.error_summary,
-          timestamp: new Date().toISOString(),
-        };
-        addBuilderLog(log);
-      }
-    );
-
     return () => {
       socket.off("connect");
       socket.off("disconnect");
@@ -223,7 +208,6 @@ export function useWebSocket(projectId?: string) {
       socket.off("pr:review_ready");
       socket.off("build:failed");
       socket.off("build:passed");
-      socket.off("aider:needs_help");
       // Fully reset so the next mount (or projectId change) gets a fresh
       // socket without stale handlers or room subscriptions.
       resetSocket();
@@ -244,6 +228,7 @@ export function useWebSocket(projectId?: string) {
     fetchChatHistory,
     fetchLogs,
     fetchPlan,
+    fetchProject,
   ]);
 
   useEffect(() => {

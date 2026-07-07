@@ -388,7 +388,7 @@ async def init_db(db_path: str) -> None:
         await db.commit()
 
         # Sweep any stale "implementing" issues that got orphaned by an orchestrator
-        # crash / restart. >30 min in `implementing` is the threshold — real Aider runs
+        # crash / restart. >30 min in `implementing` is the threshold — real builder runs
         # take at most a few minutes; anything older is dead.
         sweep_cutoff = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
         cur = await db.execute(

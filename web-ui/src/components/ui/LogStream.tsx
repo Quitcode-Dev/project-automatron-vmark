@@ -78,10 +78,10 @@ function timeAgo(timestamp: string): string {
   return `${Math.floor(diff / 3600)}h ago`;
 }
 
-// Pulls "issue #N" or "aider/fix-N" out of an activity title so the button
+// Pulls "issue #N" or "agent-sdk/fix-N" out of an activity title so the button
 // knows which issue to re-implement.
 function extractIssueNumber(text: string): number | null {
-  const m = text.match(/issue\s*#(\d+)/i) ?? text.match(/aider\/fix-(\d+)/i);
+  const m = text.match(/issue\s*#(\d+)/i) ?? text.match(/agent-sdk\/fix-(\d+)/i);
   return m ? Number(m[1]) : null;
 }
 
@@ -94,9 +94,9 @@ function ActivityEntry({ log }: { log: BuilderLog }) {
 
   const isError = log.status === "ERROR" || log.status === "BLOCKER";
   const issueNumber = isError ? extractIssueNumber(log.task_text) : null;
-  const showSendToAider = isError && issueNumber !== null;
+  const showRetry = isError && issueNumber !== null;
 
-  const handleSendToAider = async () => {
+  const handleRetry = async () => {
     if (issueNumber === null || sending || sent) return;
     setSending(true);
     try {
@@ -110,7 +110,7 @@ function ActivityEntry({ log }: { log: BuilderLog }) {
       await reimplementWithContext(log.project_id, issueNumber, context);
       setSent(true);
     } catch (err) {
-      console.error("Send to Aider failed:", err);
+      console.error("Retry with context failed:", err);
       setSending(false);
     }
   };
@@ -174,9 +174,9 @@ function ActivityEntry({ log }: { log: BuilderLog }) {
           </pre>
         )}
 
-        {showSendToAider && (
+        {showRetry && (
           <button
-            onClick={handleSendToAider}
+            onClick={handleRetry}
             disabled={sending || sent}
             className={cn(
               "mt-2 inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs font-medium transition-colors",
@@ -195,10 +195,10 @@ function ActivityEntry({ log }: { log: BuilderLog }) {
               <Wrench className="h-3 w-3" />
             )}
             {sent
-              ? `Sent to Aider for issue #${issueNumber}`
+              ? `Retrying issue #${issueNumber}`
               : sending
                 ? "Sending…"
-                : `Send to Aider (issue #${issueNumber})`}
+                : `Retry with context (issue #${issueNumber})`}
           </button>
         )}
       </div>

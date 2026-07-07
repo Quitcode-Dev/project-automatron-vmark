@@ -269,7 +269,7 @@ export async function assignIssueToCopilot(
   return request(`/api/projects/${projectId}/issues/${issueNumber}/assign-copilot`, { method: "POST" });
 }
 
-export async function implementWithAider(
+export async function implementIssue(
   projectId: string,
   issueNumber: number
 ): Promise<{ status: string }> {

@@ -8,11 +8,13 @@ from orchestrator.config import settings
 
 LlmProvider = Literal["openai", "anthropic", "google"]
 LlmRole = Literal["architect", "builder", "reviewer"]
-BuilderEngine = Literal["aider", "agent_sdk"]
+BuilderEngine = Literal["agent_sdk"]
 
 SUPPORTED_PROVIDERS: tuple[LlmProvider, ...] = ("openai", "anthropic", "google")
-SUPPORTED_BUILDER_ENGINES: tuple[BuilderEngine, ...] = ("aider", "agent_sdk")
-DEFAULT_BUILDER_ENGINE: BuilderEngine = "aider"
+# Agent SDK is the only builder engine. `normalize_builder_engine` coerces any
+# legacy value (e.g. a stored "aider") to this, so old projects migrate cleanly.
+SUPPORTED_BUILDER_ENGINES: tuple[BuilderEngine, ...] = ("agent_sdk",)
+DEFAULT_BUILDER_ENGINE: BuilderEngine = "agent_sdk"
 
 
 def infer_provider_from_model(model: str, fallback: LlmProvider = "openai") -> LlmProvider:
@@ -86,8 +88,8 @@ def default_llm_config() -> dict[str, dict[str, str]]:
         }
         for role in ("architect", "builder", "reviewer")
     }
-    # Builder gets an extra `engine` field — Aider subprocess vs Anthropic
-    # Agent SDK tool-loop. Default stays Aider while agent_sdk matures.
+    # Builder carries an `engine` field for forward-compat; today the only
+    # supported value is the Anthropic Agent SDK tool-loop.
     result["builder"]["engine"] = DEFAULT_BUILDER_ENGINE
     return result
 

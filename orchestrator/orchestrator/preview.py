@@ -185,14 +185,14 @@ async def run_preview_locally(
 
     If `branch` is provided, that branch is checked out instead of `default_branch`.
     If `issue_number` is provided, it's appended to every activity_log title so the
-    UI's "Send to Aider" button on ERROR rows can extract the right issue.
+    UI's "Retry with context" button on ERROR rows can extract the right issue.
     """
     from orchestrator.models.project import save_activity_log, get_activity_logs
     from orchestrator.api.websocket import emit_error
 
     workspace = settings.workspace_base_dir / str(project_id)
     workspace.mkdir(parents=True, exist_ok=True)
-    # Use a separate directory from the aider workspace to avoid branch conflicts
+    # Use a separate directory from the builder workspace to avoid branch conflicts
     repo_dir = workspace / "preview-repo"
 
     target_branch = branch or default_branch
@@ -246,7 +246,7 @@ async def run_preview_locally(
         return None
 
     # Compose: merge default_branch into target_branch so the preview reflects
-    # what shipping the PR would actually produce. Without this, an Aider branch
+    # what shipping the PR would actually produce. Without this, a builder branch
     # cut from an older main misses any scaffolding/config commits that landed
     # on main after the branch was created (e.g. orchestrator-managed scaffold).
     if target_branch != default_branch:
@@ -362,7 +362,12 @@ async def run_preview_locally(
 
     _ensure_dockerfile(repo_dir, project_type)
 
-    port = _find_free_port()
+    # Traefik mode (production): publish the preview as an HTTPS subdomain via
+    # the reverse proxy instead of a raw host:port (unreachable behind Traefik and
+    # blocked as mixed content in the HTTPS app). Falls back to host:port locally.
+    use_traefik = bool(settings.preview_base_domain)
+    slug = f"preview-{str(project_id).replace('-', '')[:12]}"
+    port = None if use_traefik else _find_free_port()
     container_name = f"preview-{project_id}"
     image_name = f"automatron-preview-{project_id}"
 
@@ -423,15 +428,29 @@ async def run_preview_locally(
         # Run — pass env_vars as runtime environment too. Belt-and-braces
         # alongside the .env files; some frameworks (or custom servers) read
         # process.env directly without dotenv loading.
+        run_kwargs: dict = dict(
+            detach=True,
+            name=container_name,
+            restart_policy={"Name": "unless-stopped"},
+            environment=env_vars or None,
+        )
+        if use_traefik:
+            # Attach to the reverse-proxy network with Traefik labels so the
+            # container is served at https://<slug>.<preview_base_domain>. No host
+            # port is published — Traefik reaches the container over the network.
+            preview_host = f"{slug}.{settings.preview_base_domain}"
+            run_kwargs["network"] = settings.preview_traefik_network
+            run_kwargs["labels"] = {
+                "traefik.enable": "true",
+                f"traefik.http.routers.{slug}.rule": f"Host(`{preview_host}`)",
+                f"traefik.http.routers.{slug}.entrypoints": settings.preview_traefik_entrypoint,
+                f"traefik.http.routers.{slug}.tls.certresolver": settings.preview_traefik_certresolver,
+                f"traefik.http.services.{slug}.loadbalancer.server.port": str(internal_port),
+            }
+        else:
+            run_kwargs["ports"] = {f"{internal_port}/tcp": port}
         try:
-            client.containers.run(
-                image_name,
-                detach=True,
-                name=container_name,
-                ports={f"{internal_port}/tcp": port},
-                restart_policy={"Name": "unless-stopped"},
-                environment=env_vars or None,
-            )
+            client.containers.run(image_name, **run_kwargs)
         except Exception as exc:
             logger.error("Preview: docker run failed: %s", exc)
             await _log("Preview: docker run FAILED", str(exc), "ERROR")
@@ -441,8 +460,11 @@ async def run_preview_locally(
             )
             return None
         await _log(
-            f"Preview: container started on port {port}",
-            f"Container `{container_name}` from image `{image_name}` mapped {internal_port} → {port}.",
+            f"Preview: container started"
+            + (f" → https://{slug}.{settings.preview_base_domain}" if use_traefik else f" on port {port}"),
+            f"Container `{container_name}` from image `{image_name}`"
+            + (f" routed via Traefik ({settings.preview_traefik_network})." if use_traefik
+               else f" mapped {internal_port} → {port}."),
         )
     finally:
         try:
@@ -450,17 +472,23 @@ async def run_preview_locally(
         except Exception as exc:
             logger.warning("Preview: docker client close failed: %s", exc)
 
-    # Public URL shown to users
-    from urllib.parse import urlparse
-    public = (settings.automatron_public_url or "").rstrip("/")
-    if public:
-        host = urlparse(public).hostname or "localhost"
+    # Public URL shown to users + the URL we health-check against.
+    if use_traefik:
+        preview_url = f"https://{slug}.{settings.preview_base_domain}"
+        # The raw port isn't published in Traefik mode, so poll the container
+        # directly over the reverse-proxy network by its name (the orchestrator
+        # shares that network in production).
+        health_url = f"http://{container_name}:{internal_port}"
     else:
-        host = "localhost"
-    preview_url = f"http://{host}:{port}"
-
-    # Health-check using localhost — containers can't reach the public hostname via hairpin NAT
-    health_url = f"http://localhost:{port}"
+        from urllib.parse import urlparse
+        public = (settings.automatron_public_url or "").rstrip("/")
+        if public:
+            host = urlparse(public).hostname or "localhost"
+        else:
+            host = "localhost"
+        preview_url = f"http://{host}:{port}"
+        # Health-check using localhost — containers can't reach the public hostname via hairpin NAT
+        health_url = f"http://localhost:{port}"
     logger.info("Preview: container started, polling %s", health_url)
     await _log("Preview: waiting for HTTP readiness", f"Polling {health_url} every 3s for up to 60s.")
 
