@@ -14,10 +14,14 @@ interface OnboardingState {
   seenTourByEmail: Record<string, boolean>;
   replayNonce: number;
   checklistDismissed: boolean;
+  /** Completed /learn lessons, keyed by slug. */
+  lessonsDone: Record<string, boolean>;
   hasSeenTour: (email: string | null | undefined) => boolean;
   markTourSeen: (email: string | null | undefined) => void;
   dismissChecklist: () => void;
   requestReplay: () => void;
+  isLessonDone: (slug: string) => boolean;
+  setLessonDone: (slug: string, done: boolean) => void;
 }
 
 const keyFor = (email: string | null | undefined) => email || "_local";
@@ -36,6 +40,7 @@ export const useOnboardingStore = create<OnboardingState>()(
       seenTourByEmail: {},
       checklistDismissed: false,
       replayNonce: 0,
+      lessonsDone: {},
       hasSeenTour: (email) => Boolean(get().seenTourByEmail[keyFor(email)]),
       markTourSeen: (email) =>
         set((s) => ({
@@ -43,6 +48,9 @@ export const useOnboardingStore = create<OnboardingState>()(
         })),
       dismissChecklist: () => set({ checklistDismissed: true }),
       requestReplay: () => set((s) => ({ replayNonce: s.replayNonce + 1 })),
+      isLessonDone: (slug) => Boolean(get().lessonsDone[slug]),
+      setLessonDone: (slug, done) =>
+        set((s) => ({ lessonsDone: { ...s.lessonsDone, [slug]: done } })),
     }),
     {
       name: "automatron-onboarding",
@@ -51,6 +59,7 @@ export const useOnboardingStore = create<OnboardingState>()(
       partialize: (s) => ({
         seenTourByEmail: s.seenTourByEmail,
         checklistDismissed: s.checklistDismissed,
+        lessonsDone: s.lessonsDone,
       }),
     }
   )
