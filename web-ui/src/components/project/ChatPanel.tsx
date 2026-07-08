@@ -10,6 +10,7 @@ interface ChatPanelProps {
   messages: ChatMessage[];
   onSendMessage: (message: string) => void;
   disabled?: boolean;
+  thinking?: boolean;
   placeholder?: string;
 }
 
@@ -17,16 +18,17 @@ export function ChatPanel({
   messages,
   onSendMessage,
   disabled = false,
+  thinking = false,
   placeholder,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  // Auto-scroll
+  // Auto-scroll (also when the thinking indicator appears)
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  }, [messages, thinking]);
 
   const handleSend = () => {
     const trimmed = input.trim();
@@ -114,6 +116,23 @@ export function ChatPanel({
             </div>
           </div>
         ))}
+
+        {thinking && (
+          <div className="flex justify-start gap-3">
+            <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
+              <Bot className="h-4 w-4" />
+            </div>
+            <div className="rounded-xl bg-muted px-4 py-3">
+              <div className="mb-1 text-xs font-medium opacity-70">Architect</div>
+              <div className="flex items-center gap-1">
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.3s]" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/60 [animation-delay:-0.15s]" />
+                <span className="h-1.5 w-1.5 animate-bounce rounded-full bg-muted-foreground/60" />
+                <span className="ml-2 text-xs text-muted-foreground">thinking…</span>
+              </div>
+            </div>
+          </div>
+        )}
         <div ref={messagesEndRef} />
       </div>
 
@@ -132,9 +151,8 @@ export function ChatPanel({
               }
             }}
             placeholder={
-              disabled
-                ? "Chat disabled while processing..."
-                : placeholder ?? "Message the Architect..."
+              placeholder ??
+              (disabled ? "Chat disabled while processing..." : "Message the Architect...")
             }
             disabled={disabled}
             className="flex-1 rounded-lg border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"

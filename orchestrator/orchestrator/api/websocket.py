@@ -13,8 +13,12 @@ from orchestrator.observability import trace_event
 
 logger = logging.getLogger(__name__)
 
-# Stages where chat messages should remain inert ("queued for next planning run").
-# Anything else routes to the post-build feedback classifier.
+# Stages where chat is unavailable — there is no plan to act on yet, so the UI
+# disables the chat input and the backend refuses to route these to the issue
+# classifier. "intake" covers the pre-plan window (project_stage stays "intake"
+# during the architect run and only promotes to "awaiting_plan_approval" after it
+# finishes). "planning" is reserved: the frontend uses it optimistically and the
+# backend may persist it mid-run in future — routing must stay inert if so.
 _PLANNING_STAGES = {"intake", "planning"}
 
 
@@ -68,6 +72,17 @@ async def on_chat_message(sid: str, data: dict) -> None:
     if not project_id or not text:
         return
 
+    # Resolve the project BEFORE persisting or routing. A missing or soft-deleted
+    # project must not spawn orphan chat rows or reach the issue-creating classifier
+    # (the UI "delete" is a soft delete: status="deleted", project_stage="error").
+    project = await get_project(project_id)
+    if project is None or project.get("status") == "deleted":
+        logger.info("chat: message rejected — project missing/deleted (%s)", project_id)
+        await emit_error(project_id, "This project no longer exists. Reload the page.")
+        return
+
+    stage = project.get("project_stage", "intake")
+
     await save_chat_message(str(uuid.uuid4()), project_id, "user", text)
     await trace_event(
         project_id,
@@ -76,35 +91,58 @@ async def on_chat_message(sid: str, data: dict) -> None:
         {"text": text},
     )
 
-    # Route based on project stage: pre-planning chat → no-op (architect will pick it
-    # up on the next run). Anything else → feedback classifier that creates issues or
-    # asks clarification.
-    project = await get_project(project_id)
-    stage = (project or {}).get("project_stage", "intake")
-
-    if stage not in _PLANNING_STAGES:
-        # Run in background so the socket handler returns immediately
-        from orchestrator.orchestrator import GitHubOrchestrator
-        logger.info("chat: routing message to feedback classifier (stage=%s)", stage)
-        asyncio.create_task(
-            GitHubOrchestrator(project_id).process_feedback_message(text)
+    # Pre-planning (intake/planning): chat is unavailable until a plan exists. The UI
+    # disables the input in these stages; this branch is a defensive fallback and
+    # deliberately does NOT feed the message into planning (the planner reads the repo
+    # README/docs, not chat).
+    if stage in _PLANNING_STAGES:
+        logger.info("chat: ignored — chat unavailable pre-plan (stage=%s)", stage)
+        await emit_architect_message(
+            project_id,
+            "Chat opens once your plan is ready to review. I'm assembling the plan "
+            "from your repo's README and /docs — check the Plan tab shortly.",
         )
         return
 
-    # Pre-planning chat: acknowledge but don't act (the architect run will pick it up)
-    logger.info("chat: queuing message for next planning run (stage=%s)", stage)
-    await sio.emit(
-        "architect:message",
-        {
-            "project_id": project_id,
-            "content": f"[Automatron] Message queued for the next planning run:\n\n{text}",
-            "is_streaming": False,
-        },
-        room=_project_room(project_id),
-    )
+    # Plan generated, awaiting your approval: guide the user, but do NOT create issues
+    # yet — issue creation is what approving the plan triggers.
+    if stage == "awaiting_plan_approval":
+        logger.info("chat: held — awaiting plan approval (stage=%s)", stage)
+        await emit_architect_message(
+            project_id,
+            "Your plan is ready for review. Open the Plan tab to edit it, or approve "
+            "it to create GitHub issues. Once approved, message me here and I'll turn "
+            "requests like this into issues.",
+        )
+        return
+
+    # Post-approval (building, etc.): route to the feedback classifier. Show a
+    # "thinking" indicator while it runs in the background so the socket handler
+    # returns immediately; the classifier clears the indicator on reply.
+    await emit_architect_thinking(project_id, True)
+    from orchestrator.orchestrator import GitHubOrchestrator
+    logger.info("chat: routing message to feedback classifier (stage=%s)", stage)
+
+    async def _run_feedback() -> None:
+        try:
+            await GitHubOrchestrator(project_id).process_feedback_message(text)
+        except Exception:
+            logger.exception("feedback classifier failed for %s", project_id)
+            await emit_architect_message(
+                project_id,
+                "Sorry — I hit an error handling that. Please try rephrasing, or check the Activity tab.",
+            )
+        finally:
+            await emit_architect_thinking(project_id, False)
+
+    asyncio.create_task(_run_feedback())
 
 
 async def emit_architect_message(project_id: str, content: str, streaming: bool = False) -> None:
+    # Persist complete (non-streaming) architect replies so the conversation
+    # survives a page reload. Streaming chunks are transient and not saved.
+    if not streaming and content.strip():
+        await save_chat_message(str(uuid.uuid4()), project_id, "architect", content)
     await sio.emit(
         "architect:message",
         {
@@ -112,6 +150,15 @@ async def emit_architect_message(project_id: str, content: str, streaming: bool 
             "content": content,
             "is_streaming": streaming,
         },
+        room=_project_room(project_id),
+    )
+
+
+async def emit_architect_thinking(project_id: str, thinking: bool) -> None:
+    """Tell the UI the Architect is (or is no longer) working on a reply."""
+    await sio.emit(
+        "architect:thinking",
+        {"project_id": project_id, "thinking": thinking},
         room=_project_room(project_id),
     )
 

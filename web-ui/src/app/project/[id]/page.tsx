@@ -141,10 +141,19 @@ export default function ProjectPage() {
     createBuildFailureIssue,
     buildPassed,
     setBuildPassed,
+    architectThinking,
+    setArchitectThinking,
   } = useProjectStore();
   const targetSummaryKey = JSON.stringify(currentProject?.deploy_target_summary ?? null);
 
   const { sendMessage } = useWebSocket(projectId);
+
+  // Safety net: never leave the "thinking" indicator stuck if no reply arrives.
+  useEffect(() => {
+    if (!architectThinking) return;
+    const t = setTimeout(() => setArchitectThinking(false), 90000);
+    return () => clearTimeout(t);
+  }, [architectThinking, setArchitectThinking]);
 
   const loadProviderCatalog = async (
     provider: LlmProvider,
@@ -169,6 +178,12 @@ export default function ProjectPage() {
   useEffect(() => {
     if (!projectId) {
       return;
+    }
+    // Avoid flashing the previously-open project while the new one loads (the App
+    // Router reuses this [id] page across project→project navigation). Only clear on
+    // a real switch — never on a same-id refresh.
+    if (useProjectStore.getState().currentProject?.id !== projectId) {
+      useProjectStore.getState().setCurrentProject(null);
     }
     void fetchProject(projectId);
     void fetchChatHistory(projectId);
@@ -425,6 +440,16 @@ export default function ProjectPage() {
       </AppLayout>
     );
   }
+
+  // Chat availability by stage: unavailable before the plan exists (intake/planning),
+  // enabled-but-issue-free while the plan awaits approval, fully live afterward.
+  const chatStage = currentProject.project_stage || "";
+  const chatDisabled = ["intake", "planning"].includes(chatStage);
+  const chatPlaceholder = chatDisabled
+    ? "Chat opens once your plan is ready to review."
+    : chatStage === "awaiting_plan_approval"
+      ? "Review the plan in the Plan tab. Messages here won't create issues until you approve it."
+      : "Request a change or report a bug — Automatron will draft GitHub issues for your review.";
 
   return (
     <AppLayout>
@@ -869,17 +894,9 @@ export default function ProjectPage() {
           <ChatPanel
             messages={chatMessages}
             onSendMessage={sendMessage}
-            disabled={!currentProject}
-            placeholder={
-              currentProject &&
-              ![
-                "intake",
-                "planning",
-                "awaiting_plan_approval",
-              ].includes(currentProject.project_stage || "")
-                ? "Request a change or report a bug — Automatron will draft GitHub issues for your review."
-                : undefined
-            }
+            thinking={architectThinking}
+            disabled={chatDisabled}
+            placeholder={chatPlaceholder}
           />
         )}
 

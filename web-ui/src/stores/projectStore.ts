@@ -21,6 +21,7 @@ interface ProjectState {
   issues: GithubIssue[];
   planMd: string | null;
   isConnected: boolean;
+  architectThinking: boolean;
   isLoading: boolean;
   error: string | null;
   humanRequired: boolean;
@@ -39,6 +40,7 @@ interface ProjectState {
   setDeployRuns: (deployRuns: DeployRun[]) => void;
   setPlanMd: (planMd: string | null) => void;
   setConnected: (connected: boolean) => void;
+  setArchitectThinking: (thinking: boolean) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
   setHumanRequired: (
@@ -122,6 +124,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   issues: [],
   planMd: null,
   isConnected: false,
+  architectThinking: false,
   isLoading: false,
   error: null,
   humanRequired: false,
@@ -163,6 +166,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
   setDeployRuns: (deployRuns) => set({ deployRuns }),
   setPlanMd: (planMd) => set({ planMd }),
   setConnected: (connected) => set({ isConnected: connected }),
+  setArchitectThinking: (thinking) => set({ architectThinking: thinking }),
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error }),
   setHumanRequired: (required, reason, stage) =>
@@ -194,6 +198,23 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
     set({ isLoading: true, error: null });
     try {
       const project = await api.getProject(id);
+      if (project.status === "deleted") {
+        // Soft-deleted projects still return 200 (status="deleted"), not 404, so the
+        // catch below won't fire. Treat them as gone here too — otherwise the page
+        // renders a live-looking UI for a project the backend will refuse to act on.
+        set({
+          error: "This project has been deleted.",
+          isLoading: false,
+          currentProject: null,
+          chatMessages: [],
+          issues: [],
+          planMd: null,
+          humanRequired: false,
+          humanReason: null,
+          humanStage: null,
+        });
+        return;
+      }
       set((state) => ({
         projects: state.projects.some((item) => item.id === project.id)
           ? state.projects.map((item) => (item.id === project.id ? project : item))
@@ -212,7 +233,28 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
         isLoading: false,
       }));
     } catch (error: any) {
-      set({ error: error.message, isLoading: false });
+      // A 404 means the project is gone (deleted in another tab, or a bad URL).
+      // Clear the stale project so the page shows the "Project not found." state and
+      // chat disables — don't leave a live-looking UI pointing at a dead project.
+      // Other errors (5xx/network) keep the banner-only behavior so a transient blip
+      // doesn't wipe the open project.
+      const notFound =
+        typeof error?.message === "string" && error.message.startsWith("API 404");
+      set(
+        notFound
+          ? {
+              error: error.message,
+              isLoading: false,
+              currentProject: null,
+              chatMessages: [],
+              issues: [],
+              planMd: null,
+              humanRequired: false,
+              humanReason: null,
+              humanStage: null,
+            }
+          : { error: error.message, isLoading: false }
+      );
     }
   },
 

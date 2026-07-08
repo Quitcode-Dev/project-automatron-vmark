@@ -30,6 +30,7 @@ export function useWebSocket(projectId?: string) {
     addChatMessage,
     patchProject,
     setConnected,
+    setArchitectThinking,
     setHumanRequired,
     setPlanMd,
     setProgress,
@@ -72,6 +73,8 @@ export function useWebSocket(projectId?: string) {
       if (data.is_streaming) {
         return;
       }
+      // A complete architect reply arrived — the loop is closed.
+      setArchitectThinking(false);
       const message: ChatMessage = {
         id: crypto.randomUUID(),
         project_id: data.project_id,
@@ -80,6 +83,11 @@ export function useWebSocket(projectId?: string) {
         timestamp: new Date().toISOString(),
       };
       addChatMessage(message);
+    });
+
+    socket.on("architect:thinking", (data: { project_id: string; thinking: boolean }) => {
+      if (projectId && data.project_id !== projectId) return;
+      setArchitectThinking(Boolean(data.thinking));
     });
 
     socket.on("builder:log", (data: WsBuilderLog) => {
@@ -134,6 +142,7 @@ export function useWebSocket(projectId?: string) {
 
     socket.on("run:error", (data: { project_id: string; message: string; stage: string }) => {
       if (projectId && data.project_id !== projectId) return;
+      setArchitectThinking(false);
       const log: BuilderLog = {
         project_id: data.project_id,
         task_index: -1,
@@ -199,6 +208,7 @@ export function useWebSocket(projectId?: string) {
       socket.off("connect");
       socket.off("disconnect");
       socket.off("architect:message");
+      socket.off("architect:thinking");
       socket.off("builder:log");
       socket.off("status:update");
       socket.off("human:required");
@@ -218,6 +228,7 @@ export function useWebSocket(projectId?: string) {
     patchProject,
     projectId,
     setConnected,
+    setArchitectThinking,
     setHumanRequired,
     setIssues,
     setPlanMd,
@@ -252,7 +263,20 @@ export function useWebSocket(projectId?: string) {
     (message: string) => {
       if (!projectId) return;
 
+      const { currentProject, isConnected, setError } = useProjectStore.getState();
+      // Don't send into a project that's gone (deleted / 404-cleared) or over a dead
+      // socket — Socket.IO silently buffers the emit and the user is left staring at
+      // a thinking spinner for a message that never gets a reply.
+      if (!currentProject || currentProject.id !== projectId) {
+        setError("This project is no longer available.");
+        return;
+      }
       const socket = getSocket();
+      if (!isConnected || !socket.connected) {
+        setError("Not connected — your message wasn't sent. Reconnecting…");
+        return;
+      }
+
       socket.emit("chat:message", { project_id: projectId, message });
 
       const optimisticMessage: ChatMessage = {
@@ -263,8 +287,11 @@ export function useWebSocket(projectId?: string) {
         timestamp: new Date().toISOString(),
       };
       addChatMessage(optimisticMessage);
+      // Immediate feedback while the Architect works (the backend also emits
+      // architect:thinking; whichever lands first wins, both clear on reply).
+      setArchitectThinking(true);
     },
-    [addChatMessage, projectId]
+    [addChatMessage, setArchitectThinking, projectId]
   );
 
   return { sendMessage };
