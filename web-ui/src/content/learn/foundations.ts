@@ -16,20 +16,25 @@ export const foundationsLessons: Lesson[] = [
     body: `
 Automatron is built for **you to run a software project without writing code**.
 You don't need to be a developer. Think of yourself as the **product owner and
-reviewer**: you say what you want, an AI engineering team builds it, and you
-check and approve the result.
+reviewer**: you bring the requirements, an AI engineering team builds them, and
+you check and approve the result.
 
 > [!ROLE] What you actually do
 > Just three things, over and over:
-> 1. **Describe** what you want — in plain language.
+> 1. **Point Automatron at your requirements.** Your repo already holds the
+>    product spec — the PRD, epics and user stories, written in plain product
+>    language. The Architect translates that into a technical plan; you don't
+>    write it.
 > 2. **Approve** the plan before any work starts.
 > 3. **Review** each change the AI proposes, and approve it (or send it back).
 
 ## Who does what
 
-- **You** — describe the goal, approve the plan, review pull requests, decide
-  when to preview and when to ship. You are the final say.
-- **The Architect (AI)** — turns your description into a concrete plan of work.
+- **You** — bring the requirements (already written up in your repo), approve
+  the plan, review pull requests, and decide when to preview and when to ship.
+  You are the final say.
+- **The Architect (AI)** — translates your product spec (PRD, epics, user
+  stories) into a concrete technical plan of work.
 - **The Builder (AI)** — writes the actual code for each task.
 - **The Reviewer (AI)** — checks each change and leaves you a plain-language
   verdict, so you're never reading raw code alone.

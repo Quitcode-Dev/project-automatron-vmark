@@ -16,15 +16,17 @@ export const gettingStartedLessons: Lesson[] = [
     minutes: 3,
     prerequisites: ["your-role"],
     body: `
-Automatron takes a GitHub repository and a description of what you want, and runs
-the whole build for you. **You direct and review; the AI plans, writes, and
-checks.** (New to that idea? Start with [Your role](/learn/your-role).)
+Automatron takes a GitHub repository that already describes what you want — its
+**PRD, epics and user stories** — and runs the whole build for you. **You direct
+and review; the AI translates the spec, then plans, writes, and checks.** (New to
+that idea? Start with [Your role](/learn/your-role).)
 
 ## The five stages
 Every project moves left-to-right — the tracker at the top of a project shows
 where you are:
 
-1. **Intake** — you connect a repo and describe the work.
+1. **Intake** — you connect a repo that already holds your requirements (PRD,
+   epics, user stories).
 2. **Plan** — the Architect drafts a plan. **You approve it** (gate #1).
 3. **Build** — each task becomes an issue; the AI writes it and opens a pull
    request. **You review and merge** each one.
@@ -88,8 +90,9 @@ where you are:
     minutes: 4,
     prerequisites: ["create-your-first-project"],
     body: `
-Once the project starts, the Architect writes a **plan** — a breakdown of the
-work into **Epics → Stories → Tasks**. Nothing is built until you approve it.
+Once the project starts, the Architect turns your product spec into a **technical
+plan** — a breakdown into **Epics → Stories → Tasks**. Nothing is built until you
+approve it.
 
 > [!DO] Do this
 > 1. Open the **Plan** tab and read **PLAN.md**.
