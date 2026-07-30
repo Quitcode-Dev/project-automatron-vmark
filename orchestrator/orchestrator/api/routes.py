@@ -273,6 +273,23 @@ async def api_get_project(project_id: str) -> Any:
 @router.delete("/projects/{project_id}")
 async def api_delete_project(project_id: str) -> dict[str, str]:
     await _get_required_project(project_id)
+
+    # Reclaim a provisioned database, if this project has one. Nothing else
+    # collects them: the database, its role and its PostgREST container would
+    # otherwise outlive the project forever. Best-effort — a teardown failure
+    # must not block deleting the project, but it does get logged so the
+    # orphaned resources can be found.
+    from orchestrator.db_provision import teardown_project_database
+
+    try:
+        await teardown_project_database(project_id)
+    except Exception:
+        logger.exception(
+            "Failed to tear down provisioned database for project %s — "
+            "its database and PostgREST container may still exist",
+            project_id,
+        )
+
     await update_project_stage(project_id, "error")
     await update_project_status(project_id, "deleted")
     return {"status": "deleted", "project_id": project_id}

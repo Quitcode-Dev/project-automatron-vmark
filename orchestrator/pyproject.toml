@@ -27,6 +27,11 @@ dependencies = [
     "jsonschema>=4.21.0",
     # Builder engine: Anthropic Agent SDK tool-use loop (orchestrator/builder/agent_sdk.py).
     "anthropic>=0.40.0",
+    # Database provisioning (orchestrator/db_provision/): asyncpg drives the
+    # shared Postgres, PyJWT mints the Supabase-shaped anon/service_role keys
+    # that the per-project PostgREST validates.
+    "asyncpg>=0.30.0",
+    "PyJWT>=2.10.0",
 ]
 
 [project.optional-dependencies]

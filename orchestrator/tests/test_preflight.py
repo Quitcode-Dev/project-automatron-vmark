@@ -3,33 +3,9 @@
 from __future__ import annotations
 
 import pytest
-from docker.errors import ImageNotFound
 
 from orchestrator.config import settings
 from orchestrator.validation.preflight import PreflightService
-
-
-class _FakeImagesMissing:
-    def get(self, image: str) -> None:
-        raise ImageNotFound("missing")
-
-
-class _FakeImagesPresent:
-    def get(self, image: str) -> dict[str, str]:
-        return {"image": image}
-
-
-class _FakeDockerClient:
-    def __init__(self, images: object) -> None:
-        self.images = images
-
-    def ping(self) -> bool:
-        return True
-
-
-class _FakeContainerManager:
-    def __init__(self, client: object) -> None:
-        self.client = client
 
 
 class _FakeActionsManager:
@@ -54,39 +30,6 @@ class _FakeRepoManager:
 
 
 @pytest.mark.asyncio
-async def test_start_preflight_blocks_on_missing_golden_image(monkeypatch):
-    monkeypatch.setattr(settings, "github_token", "gh-token")
-    monkeypatch.setattr(settings, "github_owner", "dev-quitcode")
-    monkeypatch.setattr(settings, "openai_api_key", "openai-key")
-    async def fake_catalog(provider: str, *, force_refresh: bool = False) -> dict[str, object]:
-        return {
-            "provider": provider,
-            "configured": True,
-            "models": [{"id": "gpt-4.1"}, {"id": "gpt-4.1-mini"}],
-        }
-    monkeypatch.setattr("orchestrator.validation.preflight.get_provider_model_catalog", fake_catalog)
-
-    service = PreflightService(
-        container_manager=_FakeContainerManager(_FakeDockerClient(_FakeImagesMissing())),
-    )
-
-    result = await service.run(
-        "start",
-        project={
-            "llm_config": {
-                "architect": {"provider": "openai", "model": "gpt-4.1"},
-                "builder": {"provider": "openai", "model": "gpt-4.1-mini"},
-                "reviewer": {"provider": "openai", "model": "gpt-4.1-mini"},
-            }
-        },
-    )
-
-    assert result.blocking is True
-    codes = {check.code for check in result.checks}
-    assert "golden_image_missing" in codes
-
-
-@pytest.mark.asyncio
 async def test_start_preflight_blocks_on_missing_provider_key(monkeypatch):
     monkeypatch.setattr(settings, "github_token", "gh-token")
     monkeypatch.setattr(settings, "github_owner", "dev-quitcode")
@@ -100,9 +43,7 @@ async def test_start_preflight_blocks_on_missing_provider_key(monkeypatch):
         }
     monkeypatch.setattr("orchestrator.validation.preflight.get_provider_model_catalog", fake_catalog)
 
-    service = PreflightService(
-        container_manager=_FakeContainerManager(_FakeDockerClient(_FakeImagesPresent())),
-    )
+    service = PreflightService()
 
     result = await service.run(
         "start",
@@ -121,7 +62,7 @@ async def test_start_preflight_blocks_on_missing_provider_key(monkeypatch):
 
 
 def test_deploy_target_shape_validation_normalizes_health_path():
-    service = PreflightService(container_manager=_FakeContainerManager(None))
+    service = PreflightService()
 
     checks = service.validate_deploy_target_shape(
         {
@@ -153,9 +94,7 @@ async def test_start_preflight_blocks_on_unavailable_model(monkeypatch):
 
     monkeypatch.setattr("orchestrator.validation.preflight.get_provider_model_catalog", fake_catalog)
 
-    service = PreflightService(
-        container_manager=_FakeContainerManager(_FakeDockerClient(_FakeImagesPresent())),
-    )
+    service = PreflightService()
 
     result = await service.run(
         "start",
@@ -178,10 +117,7 @@ async def test_deploy_preflight_blocks_when_environment_public_key_access_fails(
     monkeypatch.setattr(settings, "github_token", "gh-token")
     monkeypatch.setattr(settings, "github_owner", "dev-quitcode")
 
-    service = PreflightService(
-        container_manager=_FakeContainerManager(_FakeDockerClient(_FakeImagesPresent())),
-        repository_manager=_FakeRepoManager(),
-    )
+    service = PreflightService(repository_manager=_FakeRepoManager())
 
     result = await service.run(
         "deploy",

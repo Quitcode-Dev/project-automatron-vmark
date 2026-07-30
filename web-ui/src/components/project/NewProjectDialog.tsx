@@ -266,6 +266,12 @@ export function NewProjectDialog({ open, onClose }: NewProjectDialogProps) {
                 Provide your Supabase credentials so Automatron can introspect the live database schema
                 and generate code against your real tables — not guesses from migration files.
               </p>
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                Leave all three blank if this project doesn&apos;t need a database — the scaffold
+                omits Supabase entirely rather than shipping dependencies it can&apos;t satisfy.
+                Self-hosted works too: any endpoint serving PostgREST at <code>/rest/v1/</code> is
+                accepted, so use your gateway origin instead of a <code>supabase.co</code> URL.
+              </p>
             </div>
 
             <div className="mt-3 space-y-3">

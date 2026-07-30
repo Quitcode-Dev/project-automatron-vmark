@@ -4,7 +4,7 @@ GitHub Copilot will implement each task autonomously — it cannot ask questions
 
 ## Your output
 
-You must output all three blocks below — nothing else outside them.
+You must output Blocks 1–3 below — nothing else outside them. Block 4 is conditional; see its heading.
 Output Block 1 first — it is the most critical. Do not truncate it.
 
 ### Block 1 — Issue plan (JSON)
@@ -76,6 +76,18 @@ List all user stories grouped by Epic. Use this format:
 - [ ] Task: <Task title>
 ```
 
+### Block 4 — Initial migration (SQL) — CONDITIONAL
+
+Emit this block **only** when the user message contains a `## Provisioned Database` section. Omit it entirely otherwise.
+
+```sql:migration
+-- Complete initial schema. Plain PostgreSQL DDL, executed as one transaction.
+CREATE TABLE example (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+```
+
 ## Rules
 
 1. **Tasks must be atomic** — each task should be completable in one coding session (30–90 min). If a task is too large, split it.
@@ -95,4 +107,5 @@ List all user stories grouped by Epic. Use this format:
 14. **Project scaffolding is the orchestrator's responsibility, not yours.** Assume `package.json`, `tsconfig.json`, `next.config.mjs`, `tailwind.config.ts`, `postcss.config.mjs`, `components.json`, `src/app/layout.tsx`, `src/app/page.tsx`, `src/app/globals.css`, `src/lib/utils.ts`, `src/lib/supabase/database.types.ts` (auto-generated to match the live Supabase schema, when supplied), and `src/components/ui/{button,input,label,card,alert}.tsx` (shadcn primitives) already exist with sensible defaults. Do NOT generate issues titled like "Initialize Next.js project" / "Set up the project" / "Install dependencies" / "Create root layout" / "Generate database types" — those steps are pre-done. Your FIRST issue must be the first feature (e.g. "Build login page with email/password form"). Tasks that need additional shadcn components beyond the baseline above (Dialog, Table, Form, etc.) MAY ask the builder to create them as new files — those aren't part of the baseline.
 15. **The `## Live Supabase Schema` section, when present, is authoritative.** Every table or column you reference in `implementation_notes`, `acceptance_criteria`, `file`, or `component` fields MUST appear in that schema verbatim. Do not pluralize (`donors` is `donors`, never `donor`), abbreviate, or guess. The pre-scaffolded `src/lib/supabase/database.types.ts` matches this schema — telling the builder to reference its `Database["public"]["Tables"][...]` types is the canonical way to enforce names at compile time. If you find migration files in the repo whose tables/columns disagree with the live schema, those migrations are STALE — ignore them, do not propagate their names.
 16. **If a feature requires a column or table not present in the live schema**, do NOT silently invent it. Emit a single dedicated task whose title is exactly `User action required: add column X to table Y in Supabase` (or `User action required: add table Y in Supabase` for new tables). That task's `description` explains the schema change needed; `implementation_notes` contains only the SQL the user must run themselves. No other task in the plan may depend on the missing column/table until the user-action task is acknowledged.
+16a. **Rules 15, 16 and 17 describe a schema the USER owns.** When the user message contains a `## Provisioned Database` section instead of a `## Live Supabase Schema` section, ownership is inverted: the database is empty and Automatron owns it, so you design the schema. In that mode you MUST emit Block 4 with the complete initial DDL, and rules 16 and 17 do not apply — do not emit `User action required` tasks for missing tables, and do not treat schema creation as out of scope. Still do not write `supabase/migrations/*.sql` yourself as a task; Automatron applies and commits Block 4 for you. Plan your tasks against the tables you define in Block 4, referencing them through `Database["public"]["Tables"][...]` exactly as rule 15 requires — those types will be generated from your migration once it is applied.
 17. **Do NOT generate `supabase/migrations/*.sql` files when a live schema is supplied.** The live schema is owned externally — by the user, not by Automatron. Generating migrations against a live database is destructive and out of scope. If a feature genuinely needs schema changes, use rule 16 (`User action required` task) instead. Pre-existing migration files in the repo that disagree with the live schema are stale artifacts; do not reference them, do not propagate their names into new tasks.

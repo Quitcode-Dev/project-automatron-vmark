@@ -323,6 +323,28 @@ def _infer_table_kind(name: str, table: dict[str, Any]) -> str:
     return "view"
 
 
+async def _introspect_after_migration(
+    supabase_url: str,
+    service_role_key: str,
+    attempts: int = 6,
+    delay_seconds: float = 1.5,
+) -> SupabaseSchema:
+    """Introspect, retrying while PostgREST is still rebuilding its schema cache.
+
+    `NOTIFY pgrst, 'reload schema'` is fire-and-forget: PostgREST reloads
+    asynchronously, so introspecting immediately after a migration reliably sees
+    the OLD (empty) cache and reports "No tables exposed". Retrying is the fix —
+    there is no synchronous "cache is current" signal to wait on.
+    """
+    result = await _introspect_supabase_schema(supabase_url, service_role_key)
+    for _ in range(attempts - 1):
+        if result.ok:
+            return result
+        await asyncio.sleep(delay_seconds)
+        result = await _introspect_supabase_schema(supabase_url, service_role_key)
+    return result
+
+
 async def _introspect_supabase_schema(supabase_url: str, service_role_key: str) -> SupabaseSchema:
     """Query PostgREST's OpenAPI endpoint and return a SupabaseSchema.
 
@@ -701,6 +723,85 @@ class GitHubOrchestrator:
                     "AMBIGUITY",
                 )
 
+        # No credentials: decide between the two correct outcomes. A project with
+        # no data layer should be scaffolded WITHOUT Supabase (its deps would
+        # otherwise trip the schema gate below over a dependency nobody chose);
+        # a project that needs persistence gets a database provisioned here.
+        #
+        # A freshly provisioned database is EMPTY, which introspection reports as
+        # a failure — correctly. `provisioned_empty` records that we know why, so
+        # the gate below defers until the architect's migration has been applied
+        # rather than aborting on a database we are about to populate.
+        provisioned_empty = False
+        if (
+            early_supabase_url
+            and settings.db_base_domain
+            and early_supabase_url.endswith(f".{settings.db_base_domain}")
+            and early_schema is not None
+            and not early_schema.ok
+        ):
+            # An Automatron-provisioned database that is STILL empty: a previous
+            # run provisioned it and persisted the credentials, then failed
+            # before a schema was applied. Without this branch that project is
+            # permanently stuck — provisioning is skipped (credentials exist),
+            # introspection fails (no tables), and the gate aborts telling the
+            # user to fix credentials for a database Automatron created itself.
+            # Resume the migration path instead.
+            provisioned_empty = True
+            await self._log(
+                "Resuming provisioned database setup",
+                f"{early_supabase_url} exists but has no schema — a previous run did not "
+                f"complete. The architect will design and apply it now.",
+                "INFO",
+            )
+        elif not (early_supabase_url and early_supabase_key):
+            from orchestrator.db_provision.detect import needs_database
+
+            wants_db, why = needs_database(project.get("intake_text") or "", readme)
+            if not wants_db:
+                await self._log("No database needed", why, "INFO")
+            else:
+                from orchestrator.db_provision import (
+                    provision_project_database,
+                    provisioning_unavailable_reason,
+                )
+
+                blocked = provisioning_unavailable_reason()
+                if blocked:
+                    await self._log(
+                        "Database needed but provisioning is unavailable",
+                        f"{why}, but {blocked}. Planning will continue and abort at the "
+                        f"schema gate unless Supabase credentials are set on the project.",
+                        "AMBIGUITY",
+                    )
+                else:
+                    await self._log("Provisioning database", why, "RUNNING")
+                    provisioned = await provision_project_database(self.project_id)
+                    if not provisioned.ok:
+                        await self._log(
+                            "Database provisioning FAILED", provisioned.error, "ERROR"
+                        )
+                        await emit_error(
+                            self.project_id,
+                            f"Could not provision a database for this project: "
+                            f"{provisioned.error}",
+                        )
+                        return
+                    await update_project(
+                        self.project_id,
+                        supabase_url=provisioned.url,
+                        supabase_anon_key=provisioned.anon_key,
+                        supabase_service_role_key=provisioned.service_role_key,
+                    )
+                    early_supabase_url = provisioned.url
+                    early_supabase_key = provisioned.service_role_key
+                    provisioned_empty = True
+                    await self._log(
+                        "Database provisioned",
+                        f"{provisioned.url} — empty; the architect will design its schema",
+                        "SUCCESS",
+                    )
+
         # Pre-architect scaffolding step. If main has no package.json AND the
         # intake / README signals Next.js, push a vendored Next.js + Tailwind +
         # shadcn skeleton to main as a single batch of commits BEFORE the
@@ -713,6 +814,10 @@ class GitHubOrchestrator:
             self.gh, owner, repo,
             intake_text=project.get("intake_text") or "",
             readme=readme,
+            # Credential presence, NOT introspection success. Creds set but
+            # unreadable must keep the Supabase deps so the gate below still
+            # aborts; only a project with no creds at all gets them stripped.
+            has_supabase_creds=bool(early_supabase_url and early_supabase_key),
             log_fn=self._log,
             database_types_ts=(early_schema.typescript if early_schema and early_schema.ok else None),
         )
@@ -816,10 +921,24 @@ class GitHubOrchestrator:
         # architect proceed with no schema is what caused the in-flight project
         # to invent a 3-migration fictional data layer.
         supabase_schema: SupabaseSchema | None = self._cached_schema
-        supabase_url = (project.get("supabase_url") or "").strip()
-        supabase_key = (project.get("supabase_service_role_key") or "").strip()
+        # `project` was read before provisioning may have written credentials, so
+        # prefer the values that step produced.
+        supabase_url = early_supabase_url or (project.get("supabase_url") or "").strip()
+        supabase_key = early_supabase_key or (project.get("supabase_service_role_key") or "").strip()
         supabase_in_pkg = "@supabase/supabase-js" in pkg_json or "@supabase/ssr" in pkg_json
-        if supabase_schema is None and supabase_url and supabase_key:
+        if provisioned_empty:
+            # Introspection here would report "No tables exposed" and the gate
+            # would abort — on a database we provisioned seconds ago and are
+            # about to populate from the architect's own migration. The gate's
+            # invariant (prompt schema == live schema) is satisfied later, by
+            # applying that migration before anything plans against it.
+            await self._log(
+                "Schema gate deferred",
+                "Database was just provisioned and is empty by construction; the "
+                "architect designs the schema and it is verified after the migration applies.",
+                "INFO",
+            )
+        elif supabase_schema is None and supabase_url and supabase_key:
             await self._log("Introspecting Supabase schema", supabase_url, "RUNNING")
             supabase_schema = await _introspect_supabase_schema(supabase_url, supabase_key)
             if supabase_schema.ok:
@@ -831,7 +950,9 @@ class GitHubOrchestrator:
                     "SUCCESS",
                 )
 
-        if supabase_in_pkg and (supabase_schema is None or not supabase_schema.ok):
+        if supabase_in_pkg and not provisioned_empty and (
+            supabase_schema is None or not supabase_schema.ok
+        ):
             err = (
                 supabase_schema.error if supabase_schema and supabase_schema.error
                 else "Supabase credentials not set on the project"
@@ -840,8 +961,10 @@ class GitHubOrchestrator:
                 "Supabase schema unavailable — planning ABORTED",
                 f"{err}\n\nThe project's package.json includes @supabase/supabase-js but the schema "
                 f"could not be read. Refusing to let the architect invent a fictional schema. "
-                f"Fix the supabase_url + supabase_service_role_key on the project (the URL should be "
-                f"`https://<ref>.supabase.co`, not the database URL), then re-run planning.",
+                f"Fix the supabase_url + supabase_service_role_key on the project, then re-run "
+                f"planning. The URL is the PostgREST API base — `https://<ref>.supabase.co` on "
+                f"Supabase Cloud, or your gateway origin for a self-hosted instance — never the "
+                f"direct Postgres connection string.",
                 "ERROR",
             )
             await emit_error(
@@ -874,9 +997,26 @@ class GitHubOrchestrator:
             user_msg += f"{skill_context}\n\n"
         if supabase_schema and supabase_schema.ok:
             user_msg += f"## Live Supabase Schema\n\n{supabase_schema.markdown}\n\n"
+        if provisioned_empty:
+            # The prompt's rules 15-17 assume the user owns the schema. This
+            # section is the documented signal that ownership is inverted, and
+            # is what switches Block 4 (sql:migration) on.
+            user_msg += (
+                "## Provisioned Database\n\n"
+                "This project has an EMPTY PostgreSQL database provisioned by Automatron, "
+                "exposed through PostgREST exactly like Supabase. There is no existing "
+                "schema and no user-owned data to preserve — you design the schema.\n\n"
+                "You MUST emit Block 4 (`sql:migration`) containing the complete initial "
+                "DDL for every table your issue plan references. It is executed as a "
+                "single transaction against the empty database, and TypeScript types are "
+                "generated from the result, so the tables and columns you plan against "
+                "must be exactly the ones you define here.\n\n"
+            )
         if figma_context:
             user_msg += f"## Figma Design Context\n\n{figma_context}\n\n"
         user_msg += "Produce the architecture document, stories document, and issue plan now."
+        if provisioned_empty:
+            user_msg += " Include Block 4 with the initial migration."
 
         llm_cfg = await self._llm_config()
         model = llm_cfg["architect"]["model"]
@@ -907,6 +1047,75 @@ class GitHubOrchestrator:
                 len(full_response), issue_plan_raw[:200],
             )
             issue_plan = {}
+
+        # Phase 2/3 for a provisioned project: apply the architect's migration,
+        # commit it, then introspect to VERIFY. Introspection is a check here
+        # rather than an input — the live schema is built from the same block the
+        # plan was written against, which is how the gate's invariant is upheld.
+        if provisioned_empty:
+            migration_sql = _parse_tagged_block(full_response, "sql:migration") or ""
+            if not migration_sql.strip():
+                await self._log(
+                    "No migration emitted — planning ABORTED",
+                    "The database was provisioned empty and the architect was asked for "
+                    "Block 4 (sql:migration) but produced none. Refusing to plan against "
+                    "a schema that does not exist.",
+                    "ERROR",
+                )
+                await emit_error(
+                    self.project_id,
+                    "The architect did not emit an initial migration for the provisioned "
+                    "database, so there is no schema to plan against. Re-run planning.",
+                )
+                return
+
+            from orchestrator.db_provision import apply_migration
+
+            await self._log("Applying initial migration", f"{len(migration_sql)} chars", "RUNNING")
+            migration_error = await apply_migration(self.project_id, migration_sql)
+            if migration_error:
+                await self._log("Migration FAILED — planning ABORTED", migration_error, "ERROR")
+                await emit_error(
+                    self.project_id,
+                    f"The architect's initial migration could not be applied: "
+                    f"{migration_error}",
+                )
+                return
+
+            await self.gh.push_file(
+                owner, repo, "supabase/migrations/0001_init.sql", migration_sql,
+                commit_message="chore: initial schema from architect",
+                branch="main",
+            )
+
+            verified = await _introspect_after_migration(supabase_url, supabase_key)
+            if not verified.ok:
+                await self._log(
+                    "Migration applied but schema unreadable — planning ABORTED",
+                    verified.error,
+                    "ERROR",
+                )
+                await emit_error(
+                    self.project_id,
+                    f"The migration applied but the resulting schema could not be read "
+                    f"back: {verified.error}",
+                )
+                return
+
+            self._cached_schema = verified
+            self._schema_cached_at = asyncio.get_event_loop().time()
+            # Replace the scaffold's stub types with types generated from the
+            # schema that now actually exists.
+            await self.gh.push_file(
+                owner, repo, "src/lib/supabase/database.types.ts", verified.typescript,
+                commit_message="chore: generate database types from initial schema",
+                branch="main",
+            )
+            await self._log(
+                "Schema created and verified",
+                f"{len(verified.tables)} tables live; migration and generated types committed",
+                "SUCCESS",
+            )
 
         # Build a human-readable plan_md from the issue plan
         plan_md = _build_plan_md(issue_plan, architecture_md, stories_md)

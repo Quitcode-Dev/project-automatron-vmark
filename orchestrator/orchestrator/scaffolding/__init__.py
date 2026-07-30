@@ -37,6 +37,7 @@ async def maybe_scaffold_repo(
     repo: str,
     intake_text: str,
     readme: str,
+    has_supabase_creds: bool,
     log_fn: Any | None = None,
     database_types_ts: str | None = None,
 ) -> str | None:
@@ -44,6 +45,14 @@ async def maybe_scaffold_repo(
 
     Returns the framework key actually scaffolded, or None if scaffolding was
     skipped (repo already has package.json, framework not detected, etc.).
+
+    `has_supabase_creds` reports whether the project has BOTH a Supabase URL and
+    a service role key set — not whether introspecting them worked. When false
+    the scaffold omits `@supabase/*` deps and `src/lib/supabase/` so the
+    architect's schema gate doesn't abort planning over a dependency the user
+    never chose. When true but introspection failed, the deps stay and that gate
+    fires on purpose. Deliberately has no default: there is one call site, and
+    mypy strict should flag any new one that forgets to decide.
 
     `database_types_ts`, when provided, replaces the fixture stub
     `src/lib/supabase/database.types.ts` with real generated types from the
@@ -74,7 +83,12 @@ async def maybe_scaffold_repo(
 
     if framework == "nextjs":
         from orchestrator.scaffolding.nextjs import scaffold_nextjs
-        await scaffold_nextjs(gh, owner, repo, log_fn=log_fn, database_types_ts=database_types_ts)
+        await scaffold_nextjs(
+            gh, owner, repo,
+            log_fn=log_fn,
+            database_types_ts=database_types_ts,
+            include_supabase=has_supabase_creds,
+        )
         return "nextjs"
 
     return None

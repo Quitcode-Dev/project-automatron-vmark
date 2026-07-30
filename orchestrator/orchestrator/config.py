@@ -71,6 +71,45 @@ class Settings(BaseSettings):
     preview_traefik_certresolver: str = "le"
     preview_traefik_entrypoint: str = "websecure"
 
+    # --- Database provisioning ---
+    # When enabled, a project created without Supabase credentials can be given
+    # its own database on a shared Postgres, fronted by a per-project PostgREST
+    # container published as a Supabase-shaped API origin. Every downstream code
+    # path (schema introspection, database.types.ts, preview env injection) then
+    # works unchanged, because the result is indistinguishable from hosted
+    # Supabase.
+    #
+    # OFF by default and deliberately so: it makes the Automatron host stateful.
+    # Previews are disposable, databases are not — teardown, backup and disk
+    # growth all need answers before this is switched on in a deployment.
+    db_provision_enabled: bool = False
+    # DSN for the shared Postgres, as a superuser (it creates databases and
+    # roles), e.g. postgresql://postgres:pw@automatron-pg:5432/postgres
+    db_shared_postgres_dsn: str = ""
+    # Wildcard domain for provisioned API origins — a project is published at
+    # https://db-<slug>.<db_base_domain>. REQUIRED: the Supabase client and
+    # `_introspect_supabase_schema` both address PostgREST under `/rest/v1/`,
+    # which only the Traefik router's stripprefix middleware provides. Without a
+    # gateway there is no Supabase-shaped URL to hand out, so provisioning stays
+    # disabled rather than emitting an origin that 404s.
+    db_base_domain: str = ""
+    # Set when the orchestrator and the PostgREST containers reach Postgres at
+    # different addresses — e.g. the orchestrator running on the host while
+    # PostgREST resolves the database by container name on the Docker network.
+    # Only the host:port is taken from here; credentials and database name are
+    # still derived per project. Defaults to db_shared_postgres_dsn.
+    db_postgrest_dsn: str = ""
+    db_postgrest_image: str = "postgrest/postgrest:v12.2.3"
+    # Server-side master secret. Each project's JWT signing secret is derived
+    # from it by HMAC over the project id, which keeps per-project isolation
+    # (one key can't be used to forge another's) while staying stable across
+    # restarts — so no extra column is needed and reissued keys keep working.
+    # Rotating this invalidates every provisioned project's keys at once.
+    db_jwt_master_secret: str = ""
+    # Generated anon/service_role keys are long-lived, matching Supabase's own
+    # (their dashboard keys don't rotate on a timer either).
+    db_jwt_ttl_seconds: int = 10 * 365 * 24 * 3600
+
     # --- Deploy ---
     deploy_ssh_key_path: str = ""
     deploy_ssh_options: str = ""
