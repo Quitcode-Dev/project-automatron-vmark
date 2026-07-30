@@ -45,6 +45,7 @@ from orchestrator.orchestrator import (
     cancel_project_task as orch_cancel_task,
     create_issue_from_prompt as orch_create_issue_from_prompt,
     implement_issue_with_builder as orch_implement_issue,
+    is_running as orch_is_running,
     resume_project as orch_resume,
     review_pr as orch_review_pr,
     run_tracked as orch_run_tracked,
@@ -462,7 +463,14 @@ async def api_start_project(project_id: str, background_tasks: BackgroundTasks) 
 async def api_approve_plan(
     project_id: str, background_tasks: BackgroundTasks, req: ApproveRequest | None = None
 ) -> dict[str, str]:
-    await _get_required_project(project_id)
+    project = await _get_required_project(project_id)
+    # Guard against re-approval duplicating the whole issue set. No `await` between the
+    # checks and scheduling so two racing double-click requests can't both pass on the
+    # single-threaded event loop. apply_plan is also idempotent, so this is belt-and-braces.
+    if orch_is_running(project_id):
+        return {"status": "already_running", "project_id": project_id}
+    if project.get("project_stage") not in ("awaiting_plan_approval", "error"):
+        return {"status": "already_applied", "project_id": project_id}
     # Tracked (cancellable) so POST /stop can interrupt the build (apply_plan).
     orch_run_tracked(project_id, orch_resume(project_id, "plan", True))
     return {"status": "resuming", "project_id": project_id}

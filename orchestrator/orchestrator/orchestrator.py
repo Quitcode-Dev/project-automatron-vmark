@@ -1012,6 +1012,15 @@ class GitHubOrchestrator:
         # Create milestones and issues
         total = _count_tasks(issue_plan)
         created = 0
+        skipped = 0
+        # Idempotency: snapshot the issues already created for this project so a re-run
+        # (repeat approval, or a retry after a partial failure) creates only the MISSING
+        # issues instead of duplicating the whole plan. Keyed on the local DB (complete +
+        # project-scoped), matching the (epic, story, title) tuple we persist per task.
+        _seen_keys = {
+            (i.get("epic"), i.get("story"), i.get("title"))
+            for i in await list_github_issues(self.project_id)
+        }
         await self._log("Creating GitHub milestones and issues", f"{total} tasks planned")
 
         for epic in issue_plan.get("epics", []):
@@ -1038,6 +1047,11 @@ class GitHubOrchestrator:
 
                 for task in story.get("tasks", []):
                     task_title = task.get("title", "Untitled Task")
+                    dedup_key = (epic_title, story_title or None, task_title)
+                    if dedup_key in _seen_keys:
+                        skipped += 1
+                        await self._log(f"Issue exists, skipping: {task_title}", epic_title, "INFO")
+                        continue
                     # Skill content stays in the architect prompt (and reviewer), NOT in
                     # the issue body — the builder gets the spec the architect produced, and
                     # the raw skill prose would only inflate input tokens at implementation time.
@@ -1085,6 +1099,7 @@ class GitHubOrchestrator:
                             copilot_workspace_url=cw_url,
                         )
                         created += 1
+                        _seen_keys.add(dedup_key)
                         await self._log(
                             f"Issue #{issue_number}: {task_title}",
                             epic_title,
@@ -1095,9 +1110,10 @@ class GitHubOrchestrator:
                         await self._log(f"Failed: {task_title}", str(exc), "BLOCKER")
 
         await self._log(
-            f"{created}/{total} issues created on GitHub",
-            "Assign to Copilot to start building" if created else "Check errors above",
-            "SUCCESS" if created == total else "AMBIGUITY",
+            f"{created}/{total} issues created on GitHub"
+            + (f" ({skipped} already existed)" if skipped else ""),
+            "Assign to Copilot to start building" if (created or skipped) else "Check errors above",
+            "SUCCESS" if created + skipped == total else "AMBIGUITY",
         )
 
         issues = await list_github_issues(self.project_id)
@@ -1872,6 +1888,16 @@ class GitHubOrchestrator:
 
         # Create issues on GitHub + persist locally
         created_numbers: list[int] = []
+        skipped_dupes: list[str] = []
+        # Dedup: never open an issue whose title already matches an OPEN issue for this
+        # project (a re-sent request, or two near-identical messages, must not spawn
+        # twins). The per-project lock in the socket dispatcher serializes concurrent
+        # feedback runs, so this snapshot reflects issues created by a prior run.
+        open_titles = {
+            (i.get("title") or "").strip().lower()
+            for i in existing_issues
+            if (i.get("status") or "open") not in ("closed", "merged")
+        }
         milestone_id: int | None = None
         if kind == "epic" and len(issues) > 1:
             epic_title = issues[0].get("title", "New epic")
@@ -1883,6 +1909,11 @@ class GitHubOrchestrator:
 
         for issue_spec in issues:
             title = issue_spec.get("title", message[:80])
+            if title.strip().lower() in open_titles:
+                skipped_dupes.append(title)
+                await self._log("feedback: issue already open, skipping", title, "INFO")
+                continue
+            open_titles.add(title.strip().lower())  # block intra-batch twins too
             epic = issue_spec.get("epic") or "Feedback"
             body = _render_issue_body(issue_spec, epic, "", stack_summary)
             labels = issue_spec.get("labels") or ["enhancement"]
@@ -1912,6 +1943,13 @@ class GitHubOrchestrator:
                 copilot_workspace_url=html_url,
             )
             created_numbers.append(issue_number)
+
+        if skipped_dupes:
+            chat_response += (
+                "\n\n_(Skipped "
+                + ", ".join(f"“{t}”" for t in skipped_dupes)
+                + " — an open issue with that title already exists.)_"
+            )
 
         updated_issues = await list_github_issues(self.project_id)
         await emit_issues_updated(self.project_id, updated_issues)
@@ -2143,6 +2181,12 @@ def cancel_project_task(project_id: str) -> bool:
         task.cancel()
         return True
     return False
+
+
+def is_running(project_id: str) -> bool:
+    """True if a tracked orchestration task for this project is currently in-flight."""
+    task = _running_tasks.get(project_id)
+    return task is not None and not task.done()
 
 
 # ── Module-level runner functions (called by API routes) ──────────────────────

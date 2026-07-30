@@ -21,6 +21,10 @@ logger = logging.getLogger(__name__)
 # backend may persist it mid-run in future — routing must stay inert if so.
 _PLANNING_STAGES = {"intake", "planning"}
 
+# Serialize feedback processing per project so two rapid chat messages can't both
+# classify → create the same issue concurrently (a source of duplicate GitHub issues).
+_feedback_locks: dict[str, asyncio.Lock] = {}
+
 
 def _project_room(project_id: str) -> str:
     return f"project:{project_id}"
@@ -124,8 +128,12 @@ async def on_chat_message(sid: str, data: dict) -> None:
     logger.info("chat: routing message to feedback classifier (stage=%s)", stage)
 
     async def _run_feedback() -> None:
+        lock = _feedback_locks.get(project_id)
+        if lock is None:
+            lock = _feedback_locks[project_id] = asyncio.Lock()
         try:
-            await GitHubOrchestrator(project_id).process_feedback_message(text)
+            async with lock:
+                await GitHubOrchestrator(project_id).process_feedback_message(text)
         except Exception:
             logger.exception("feedback classifier failed for %s", project_id)
             await emit_architect_message(
