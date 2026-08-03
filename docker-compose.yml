@@ -30,6 +30,8 @@ services:
       # Auth.js session cookie verification (shared with web-ui)
       - AUTH_SECRET=${AUTH_SECRET:-}
       - AUTOMATRON_ALLOWED_EMAILS=${AUTOMATRON_ALLOWED_EMAILS:-}
+      # Admins see every project; the first entry inherits pre-ownership projects.
+      - AUTOMATRON_ADMIN_EMAILS=${AUTOMATRON_ADMIN_EMAILS:-}
       - AUTOMATRON_DEV_NO_AUTH=${AUTOMATRON_DEV_NO_AUTH:-false}
     restart: unless-stopped
     healthcheck:

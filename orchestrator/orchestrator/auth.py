@@ -117,10 +117,32 @@ def _allowlisted(email: str) -> bool:
     return False
 
 
+def email_can_sign_in(email: str) -> bool:
+    """Public view of the sign-in allowlist — used to reject sharing a project
+    with someone who could never sign in to see it."""
+    return _allowlisted(email)
+
+
 def _is_auth_configured() -> bool:
     """Auth is wired up as soon as we have a secret to decrypt the JWT. The
     email allowlist is optional — Google Cloud Console can gate sign-in itself."""
     return bool(settings.auth_secret)
+
+
+def is_admin(email: str) -> bool:
+    """Admins see and act on every project. Matching follows the same rules as
+    the sign-in allowlist: a full email, or a `@domain` pattern."""
+    if settings.automatron_dev_no_auth:
+        return True
+    rules = [r.strip().lower() for r in settings.automatron_admin_emails.split(",") if r.strip()]
+    email_lower = (email or "").lower()
+    for rule in rules:
+        if rule.startswith("@"):
+            if email_lower.endswith(rule):
+                return True
+        elif email_lower == rule:
+            return True
+    return False
 
 
 async def require_auth(request: Request) -> dict[str, Any]:
@@ -152,6 +174,152 @@ async def require_auth(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Email not allowlisted")
 
     return payload
+
+
+async def current_user(request: Request) -> dict[str, Any]:
+    """FastAPI dependency. The signed-in user as a local `users` row.
+
+    Upserts on every request so a first-time signer-in gets a row (and an
+    invited placeholder row gets linked to their account) without a separate
+    registration step. Cached on `request.state` — the router-level access check
+    and the route body both want it.
+    """
+    cached = getattr(request.state, "automatron_user", None)
+    if cached is not None:
+        return cached  # type: ignore[no-any-return]
+
+    session = await require_auth(request)
+    email = session.get("email") or ""
+    if not email:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Session has no email")
+
+    from orchestrator.models.user import upsert_user
+
+    user = await upsert_user(
+        sub=session.get("sub"),
+        email=email,
+        name=session.get("name"),
+        image=session.get("picture") or session.get("image"),
+    )
+    user = {**user, "is_admin": is_admin(email)}
+    request.state.automatron_user = user
+    return user
+
+
+# Path params that identify a resource *belonging* to a project, and the table to
+# resolve them through. Without these, `/deployment-targets/{target_id}` and friends
+# would be a way around the `{project_id}` check — same hole, different id.
+_PROJECT_SCOPED_PARAMS: tuple[tuple[str, str], ...] = (
+    ("target_id", "deployment_targets"),
+    ("plan_id", "deployment_plans"),
+    ("run_id", "deploy_runs"),
+)
+
+
+async def _resolve_project_id(request: Request) -> str | None:
+    """The project this request is about, from whichever id the path carries."""
+    project_id = request.path_params.get("project_id")
+    if project_id:
+        return str(project_id)
+
+    import aiosqlite
+
+    from orchestrator.models import project as project_model
+
+    for param, table in _PROJECT_SCOPED_PARAMS:
+        resource_id = request.path_params.get(param)
+        if not resource_id:
+            continue
+        if not project_model._db_path:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database not initialized. Server startup has not completed.",
+            )
+        async with aiosqlite.connect(project_model._db_path) as db:
+            cursor = await db.execute(
+                f"SELECT project_id FROM {table} WHERE id = ?",  # table name is from the tuple above
+                (resource_id,),
+            )
+            row = await cursor.fetchone()
+        if row is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+        return str(row[0])
+
+    return None
+
+
+async def require_project_access(request: Request) -> None:
+    """Router-level dependency: enforce ownership on every project-scoped route.
+
+    Registered once on `include_router`, so it covers all ~35 `{project_id}`
+    endpoints plus the deployment resources that hang off a project — including
+    any added later — instead of relying on each route to remember. It runs after
+    routing, so `path_params` is populated; requests that name no project (list,
+    create, LLM catalog) pass through.
+
+    Unauthorized access returns 404, not 403: whether a project id exists is
+    itself information the requester is not entitled to.
+    """
+    project_id = await _resolve_project_id(request)
+    if not project_id:
+        return
+
+    from orchestrator.models.project import get_project
+    from orchestrator.models.user import is_project_member
+
+    user = await current_user(request)
+    project = await get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+    if user.get("is_admin") or project.get("owner_id") == user["id"]:
+        return
+    if await is_project_member(project_id, user["id"]):
+        return
+
+    logger.warning(
+        "auth: %s denied access to project %s (owner=%s)",
+        user.get("email"),
+        project_id,
+        project.get("owner_id"),
+    )
+    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+
+
+async def require_project_owner(request: Request, project_id: str) -> dict[str, Any]:
+    """Stricter check for destructive / sharing operations: owner or admin only.
+
+    Collaborators can drive a shared project but cannot delete it or change who
+    else it is shared with. Returns the project.
+    """
+    from orchestrator.models.project import get_project
+
+    user = await current_user(request)
+    project = await get_project(project_id)
+    if not project:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    if user.get("is_admin") or project.get("owner_id") == user["id"]:
+        return project
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Only the project owner can do this")
+
+
+async def require_owned_project(request: Request) -> dict[str, Any]:
+    """Dependency form of `require_project_owner`, keyed off the `{project_id}` path param."""
+    project_id = request.path_params.get("project_id")
+    if not project_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+    return await require_project_owner(request, project_id)
+
+
+def viewer_role(project: dict[str, Any], user: dict[str, Any]) -> str:
+    """How the requesting user relates to this project — drives what the UI offers."""
+    from orchestrator.models.user import ROLE_ADMIN, ROLE_COLLABORATOR, ROLE_OWNER
+
+    if project.get("owner_id") == user.get("id"):
+        return ROLE_OWNER
+    if user.get("is_admin"):
+        return ROLE_ADMIN
+    return ROLE_COLLABORATOR
 
 
 def authenticate_socketio_environ(environ: dict[str, Any]) -> dict[str, Any] | None:

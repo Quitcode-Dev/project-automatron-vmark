@@ -160,8 +160,13 @@ class Settings(BaseSettings):
     # Comma-separated allowlist of email addresses that can sign in. Leave empty
     # to disable auth entirely (dev mode / pre-OAuth deployments).
     automatron_allowed_emails: str = ""
-    # Local-dev escape hatch: when true, require_auth always returns a fake user.
-    # NEVER set in production.
+    # Comma-separated admin emails. Admins see and act on every project regardless
+    # of ownership, and the FIRST entry is given any project that predates
+    # per-user ownership (see models.user.backfill_project_owners). Leave empty and
+    # ownerless projects stay hidden from everyone.
+    automatron_admin_emails: str = ""
+    # Local-dev escape hatch: when true, require_auth always returns a fake user
+    # who is treated as an admin. NEVER set in production.
     automatron_dev_no_auth: bool = False
 
     @field_validator("debug", mode="before")

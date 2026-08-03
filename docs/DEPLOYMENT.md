@@ -88,6 +88,7 @@ reads it from the current working directory. Key variables:
 | `AUTH_URL` | — | Public URL for NextAuth (e.g. the production URL) |
 | `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | — | Google OAuth 2.0 web client |
 | `AUTOMATRON_ALLOWED_EMAILS` | — | Sign-in allowlist (`dev@x.com` or `@x.com` domain rules) |
+| `AUTOMATRON_ADMIN_EMAILS` | — | Admins see every project; the **first** entry inherits projects created before per-user ownership |
 | `AUTOMATRON_DEV_NO_AUTH` | `false` | Local escape hatch — **never** set in production |
 | `AUTOMATRON_PUBLIC_URL` | — | Public URL; used to auto-register GitHub webhooks |
 | `DOCKER_AI_PROVIDER_PRIORITY` | `gordon,docker_agent,model_runner,litellm` | Deployment-AI backend chain (first available wins) |
