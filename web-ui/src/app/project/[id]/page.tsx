@@ -7,6 +7,7 @@ import { AppLayout } from "@/components/layout";
 import { ChatPanel } from "@/components/project/ChatPanel";
 import { IssuesBoard } from "@/components/project/IssuesBoard";
 import { PlanEditor } from "@/components/project/PlanEditor";
+import { ShareDialog } from "@/components/project/ShareDialog";
 import DeploymentPanel from "@/components/deployment/DeploymentPanel";
 import {
   cloneProjectLlmConfig,
@@ -35,6 +36,7 @@ import {
   Save,
   Server,
   Square,
+  Users,
   Workflow,
   RefreshCw,
 } from "lucide-react";
@@ -74,6 +76,7 @@ export default function ProjectPage() {
   const [previewingIssues, setPreviewingIssues] = useState<Set<number>>(new Set());
   const [isCreatingIssue, setIsCreatingIssue] = useState(false);
   const [isCheckingBuild, setIsCheckingBuild] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
   const [llmConfig, setLlmConfig] = useState<ProjectLlmConfig>(
     cloneProjectLlmConfig(defaultProjectLlmConfig)
   );
@@ -469,6 +472,23 @@ export default function ProjectPage() {
         </button>
 
         <div className="flex items-center gap-2" data-tour="action-bar">
+          {currentProject.viewer_role === "collaborator" && currentProject.owner_email && (
+            <span
+              title={`Owned by ${currentProject.owner_email}`}
+              className="rounded-full bg-muted px-2.5 py-1 text-xs text-muted-foreground"
+            >
+              Shared by {currentProject.owner_email}
+            </span>
+          )}
+
+          <button
+            onClick={() => setShareOpen(true)}
+            className="flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground"
+          >
+            <Users className="h-3.5 w-3.5" />
+            Share
+          </button>
+
           {currentProject.repo_url && (
             <a
               href={currentProject.repo_url}
@@ -1237,6 +1257,14 @@ export default function ProjectPage() {
           </div>
         )}
       </div>
+
+      <ShareDialog
+        open={shareOpen}
+        onClose={() => setShareOpen(false)}
+        projectId={projectId}
+        projectName={currentProject.name}
+        viewerRole={currentProject.viewer_role}
+      />
     </AppLayout>
   );
 }

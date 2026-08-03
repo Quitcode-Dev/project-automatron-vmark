@@ -13,15 +13,22 @@ import zipfile
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Depends, File, HTTPException, Request, UploadFile
 from pydantic import BaseModel, Field
 
+from orchestrator.auth import (
+    current_user,
+    require_owned_project,
+    require_project_owner,
+    viewer_role,
+)
 from orchestrator.llm.catalog import get_all_provider_model_catalogs, get_provider_model_catalog
 from orchestrator.llm.configuration import default_llm_config, normalize_llm_config
 from orchestrator.config import settings
 from orchestrator.models.project import (
     create_project,
     get_all_projects,
+    get_projects_for_user,
     get_chat_messages,
     get_deploy_runs,
     get_project,
@@ -164,6 +171,10 @@ class ProjectResponse(BaseModel):
     task_validation_result: dict[str, Any] = Field(default_factory=dict)
     last_escalation: dict[str, Any] = Field(default_factory=dict)
     builder_report: dict[str, Any] = Field(default_factory=dict)
+    owner_id: str | None = None
+    owner_email: str | None = None
+    # How the requesting user relates to this project: owner | admin | collaborator.
+    viewer_role: str | None = None
     created_at: str
     updated_at: str
 
@@ -200,6 +211,22 @@ class PreflightResponse(BaseModel):
     checks: list[PreflightCheckResponse] = Field(default_factory=list)
 
 
+class ProjectMemberResponse(BaseModel):
+    user_id: str
+    email: str
+    name: str | None = None
+    image: str | None = None
+    role: str
+    # True until this person signs in for the first time — the row was created
+    # by the invite, and is linked to their account on first login.
+    pending: bool = False
+
+
+class AddProjectMemberRequest(BaseModel):
+    email: str
+    role: Literal["collaborator"] = "collaborator"
+
+
 
 async def _get_required_project(project_id: str) -> dict[str, Any]:
     project = await get_project(project_id)
@@ -222,7 +249,10 @@ async def api_get_llm_provider_models(provider: str, force_refresh: bool = False
 
 
 @router.post("/projects", response_model=ProjectResponse)
-async def api_create_project(req: CreateProjectRequest) -> Any:
+async def api_create_project(
+    req: CreateProjectRequest,
+    user: dict[str, Any] = Depends(current_user),
+) -> Any:
     # repo_url takes precedence; fall back to intake_text for backward compat
     repo_url = (req.repo_url or req.intake_text or req.description or "").strip()
     if not repo_url:
@@ -254,25 +284,94 @@ async def api_create_project(req: CreateProjectRequest) -> Any:
         supabase_url=(req.supabase_url or "").strip() or None,
         supabase_service_role_key=(req.supabase_service_role_key or "").strip() or None,
         supabase_anon_key=(req.supabase_anon_key or "").strip() or None,
+        owner_id=user["id"],
     )
-    return project
+    return {**project, "viewer_role": "owner"}
 
 
 @router.get("/projects", response_model=list[ProjectResponse])
-async def api_list_projects() -> Any:
-    return await get_all_projects()
+async def api_list_projects(user: dict[str, Any] = Depends(current_user)) -> Any:
+    """Only the caller's projects — owned or shared with them. Admins see all."""
+    if user.get("is_admin"):
+        projects = await get_all_projects()
+    else:
+        projects = await get_projects_for_user(user["id"])
+    return [{**p, "viewer_role": viewer_role(p, user)} for p in projects]
 
 
 @router.get("/projects/{project_id}", response_model=ProjectResponse)
-async def api_get_project(project_id: str) -> Any:
-    return await _get_required_project(project_id)
+async def api_get_project(
+    project_id: str,
+    user: dict[str, Any] = Depends(current_user),
+) -> Any:
+    project = await _get_required_project(project_id)
+    return {**project, "viewer_role": viewer_role(project, user)}
+
+
+@router.get("/projects/{project_id}/members", response_model=list[ProjectMemberResponse])
+async def api_list_project_members(project_id: str) -> Any:
+    """Everyone this project is shared with, owner first. Visible to any member."""
+    from orchestrator.models.user import list_project_members
+
+    await _get_required_project(project_id)
+    return await list_project_members(project_id)
+
+
+@router.post("/projects/{project_id}/members", response_model=ProjectMemberResponse)
+async def api_add_project_member(
+    project_id: str,
+    req: AddProjectMemberRequest,
+    request: Request,
+) -> Any:
+    """Share a project with someone by email. Owner (or admin) only."""
+    from orchestrator.auth import email_can_sign_in
+    from orchestrator.models.user import add_project_member, normalize_email
+
+    project = await require_project_owner(request, project_id)
+    user = await current_user(request)
+
+    email = normalize_email(req.email)
+    if "@" not in email:
+        raise HTTPException(status_code=422, detail="A valid email address is required")
+    if email == (user.get("email") or "").lower():
+        raise HTTPException(status_code=422, detail="You already have access to this project")
+    if not email_can_sign_in(email):
+        raise HTTPException(
+            status_code=422,
+            detail=f"{email} is not allowed to sign in to Automatron, so sharing would have no effect",
+        )
+    if email == (project.get("owner_email") or "").lower():
+        raise HTTPException(status_code=422, detail="That person already owns this project")
+
+    return await add_project_member(project_id, email, role=req.role, invited_by=user["id"])
+
+
+@router.delete("/projects/{project_id}/members/{member_user_id}")
+async def api_remove_project_member(
+    project_id: str,
+    member_user_id: str,
+    request: Request,
+) -> dict[str, str]:
+    """Revoke a collaborator's access. Owner (or admin) only."""
+    from orchestrator.models.user import remove_project_member
+
+    project = await require_project_owner(request, project_id)
+    if project.get("owner_id") == member_user_id:
+        raise HTTPException(status_code=422, detail="The owner cannot be removed from a project")
+    if not await remove_project_member(project_id, member_user_id):
+        raise HTTPException(status_code=404, detail="Member not found")
+    return {"status": "removed", "user_id": member_user_id}
 
 
 
 
 @router.delete("/projects/{project_id}")
-async def api_delete_project(project_id: str) -> dict[str, str]:
-    await _get_required_project(project_id)
+async def api_delete_project(
+    project_id: str,
+    # Collaborators can drive a shared project but not destroy it — the dependency
+    # 404s a stranger, 403s a collaborator, and 404s a project that isn't there.
+    _project: dict[str, Any] = Depends(require_owned_project),
+) -> dict[str, str]:
 
     # Reclaim a provisioned database, if this project has one. Nothing else
     # collects them: the database, its role and its PostgREST container would

@@ -99,8 +99,25 @@ export interface Project {
   deploy_target_summary: DeployTargetSummary | null;
   plan_approved: boolean;
   preview_approved: boolean;
+  owner_id: string | null;
+  owner_email: string | null;
+  /** How the signed-in user relates to this project. Drives what the UI offers:
+   *  only an owner (or admin) may delete it or manage who it is shared with. */
+  viewer_role: ViewerRole | null;
   created_at: string;
   updated_at: string;
+}
+
+export type ViewerRole = "owner" | "admin" | "collaborator";
+
+export interface ProjectMember {
+  user_id: string;
+  email: string;
+  name: string | null;
+  image: string | null;
+  role: "owner" | "collaborator";
+  /** True until this person signs in for the first time. */
+  pending: boolean;
 }
 
 export type IssueStatus = "open" | "implementing" | "pr_open" | "pr_reviewed" | "merged" | "closed";

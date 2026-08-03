@@ -9,6 +9,7 @@ import type {
   PreflightResult,
   Project,
   ProjectCreateRequest,
+  ProjectMember,
   Session,
   UpdateProjectLlmConfigRequest,
 } from "./types";
@@ -97,6 +98,29 @@ export async function createProject(data: ProjectCreateRequest): Promise<Project
 
 export async function deleteProject(id: string): Promise<void> {
   await request(`/api/projects/${id}`, { method: "DELETE" });
+}
+
+export async function getProjectMembers(projectId: string): Promise<ProjectMember[]> {
+  return request(`/api/projects/${projectId}/members`);
+}
+
+export async function addProjectMember(
+  projectId: string,
+  email: string
+): Promise<ProjectMember> {
+  return request(`/api/projects/${projectId}/members`, {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+}
+
+export async function removeProjectMember(
+  projectId: string,
+  userId: string
+): Promise<{ status: string }> {
+  return request(`/api/projects/${projectId}/members/${userId}`, {
+    method: "DELETE",
+  });
 }
 
 export async function startProject(projectId: string): Promise<{ status: string }> {
@@ -251,6 +275,9 @@ export async function uploadFigmaFile(
   const res = await fetch(`${API_URL}/api/projects/${projectId}/figma-file`, {
     method: "POST",
     body: form,
+    // Multipart, so no JSON `request()` helper — but the session cookie is still
+    // required (auth + the project ownership check both read it).
+    credentials: "include",
   });
   if (!res.ok) throw new Error(`Figma upload failed: ${await res.text()}`);
   return res.json();

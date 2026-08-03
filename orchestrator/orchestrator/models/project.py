@@ -68,6 +68,9 @@ PROJECT_COLUMN_DEFS: dict[str, str] = {
     "supabase_url": "TEXT",
     "supabase_service_role_key": "TEXT",
     "supabase_anon_key": "TEXT",
+    # Owner — users.id. NULL only for projects created before ownership existed;
+    # models.user.backfill_project_owners claims those for the first admin.
+    "owner_id": "TEXT",
 }
 
 JSON_FIELDS = {
@@ -377,6 +380,15 @@ async def init_db(db_path: str) -> None:
             "implementing_started_at": "TEXT",
         })
         await init_deployment_schema(db)
+        # Imported here, not at module scope: models.user imports this module.
+        from orchestrator.models.user import backfill_project_owners, init_user_schema
+
+        await init_user_schema(db)
+        await db.commit()
+        await backfill_project_owners(
+            db,
+            [e.strip() for e in settings.automatron_admin_emails.split(",") if e.strip()],
+        )
         await db.commit()
         logger.info("Database initialized: %s", db_path)
 
@@ -421,6 +433,7 @@ async def create_project(
     supabase_url: str | None = None,
     supabase_service_role_key: str | None = None,
     supabase_anon_key: str | None = None,
+    owner_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a new project record."""
     await _ensure_db_ready()
@@ -451,10 +464,11 @@ async def create_project(
                 supabase_url,
                 supabase_service_role_key,
                 supabase_anon_key,
+                owner_id,
                 created_at,
                 updated_at
             )
-            VALUES (?, ?, 'pending', 'intake', ?, ?, ?, '', '{}', ?, 'pending', 'not_configured', 'not_configured', ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, 'pending', 'intake', ?, ?, ?, '', '{}', ?, 'pending', 'not_configured', 'not_configured', ?, '[]', ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 project_id,
@@ -470,6 +484,7 @@ async def create_project(
                 supabase_url,
                 supabase_service_role_key,
                 supabase_anon_key,
+                owner_id,
                 now,
                 now,
             ),
@@ -487,17 +502,56 @@ async def get_project(project_id: str) -> dict[str, Any] | None:
     await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM projects WHERE id = ?", (project_id,))
+        cursor = await db.execute(
+            """
+            SELECT p.*, u.email AS owner_email
+            FROM projects p
+            LEFT JOIN users u ON u.id = p.owner_id
+            WHERE p.id = ?
+            """,
+            (project_id,),
+        )
         row = await cursor.fetchone()
         return _serialize_project_row(row) if row else None
 
 
 async def get_all_projects() -> list[dict[str, Any]]:
-    """Get all projects ordered by creation date."""
+    """Get every project, ignoring ownership. Admin / internal use only —
+    user-facing listings must go through `get_projects_for_user`."""
     await _ensure_db_ready()
     async with aiosqlite.connect(_db_path) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM projects ORDER BY created_at DESC")
+        cursor = await db.execute(
+            """
+            SELECT p.*, u.email AS owner_email
+            FROM projects p
+            LEFT JOIN users u ON u.id = p.owner_id
+            ORDER BY p.created_at DESC
+            """
+        )
+        rows = await cursor.fetchall()
+        return [_serialize_project_row(row) for row in rows]
+
+
+async def get_projects_for_user(user_id: str) -> list[dict[str, Any]]:
+    """Projects the user owns or has been added to as a member."""
+    await _ensure_db_ready()
+    async with aiosqlite.connect(_db_path) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            """
+            SELECT p.*, u.email AS owner_email
+            FROM projects p
+            LEFT JOIN users u ON u.id = p.owner_id
+            WHERE p.owner_id = ?
+               OR EXISTS (
+                    SELECT 1 FROM project_members pm
+                    WHERE pm.project_id = p.id AND pm.user_id = ?
+               )
+            ORDER BY p.created_at DESC
+            """,
+            (user_id, user_id),
+        )
         rows = await cursor.fetchall()
         return [_serialize_project_row(row) for row in rows]
 

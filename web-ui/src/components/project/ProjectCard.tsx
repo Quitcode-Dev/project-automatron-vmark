@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { StatusBadge } from "@/components/ui/StatusBadge";
 import type { Project } from "@/lib/types";
-import { ArrowRight, Trash2, GitBranch, ExternalLink } from "lucide-react";
+import { ArrowRight, Trash2, GitBranch, ExternalLink, Users } from "lucide-react";
 
 interface ProjectCardProps {
   project: Project;
@@ -32,6 +32,10 @@ const STAGE_LABEL: Record<string, string> = {
 export function ProjectCard({ project, onDelete }: ProjectCardProps) {
   const repoUrl = project.repo_url?.replace(/\.git$/, "") ?? null;
   const stageLabel = STAGE_LABEL[project.project_stage] ?? project.project_stage.replace(/_/g, " ");
+  // Someone else's project, shared with us — say whose, and don't offer delete
+  // (the API rejects it for collaborators anyway).
+  const sharedWithMe = project.viewer_role === "collaborator";
+  const canDelete = Boolean(onDelete) && !sharedWithMe;
 
   return (
     <div className="group relative rounded-xl border border-border bg-card p-5 transition-colors hover:border-primary/30">
@@ -47,6 +51,15 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
             <span className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground">
               {stageLabel}
             </span>
+            {sharedWithMe && project.owner_email && (
+              <span
+                title={`Owned by ${project.owner_email}`}
+                className="inline-flex max-w-[14rem] items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+              >
+                <Users className="h-3 w-3 shrink-0" />
+                <span className="truncate">Shared by {project.owner_email}</span>
+              </span>
+            )}
             {repoUrl && (
               <a
                 href={repoUrl}
@@ -68,9 +81,9 @@ export function ProjectCard({ project, onDelete }: ProjectCardProps) {
       <div className="mt-4 flex items-center justify-between text-xs text-muted-foreground">
         <span>Active {timeAgo(project.updated_at)}</span>
         <div className="flex items-center gap-2">
-          {onDelete && (
+          {canDelete && (
             <button
-              onClick={(e) => { e.preventDefault(); onDelete(project.id); }}
+              onClick={(e) => { e.preventDefault(); onDelete!(project.id); }}
               className="rounded p-1 opacity-0 transition-opacity hover:bg-destructive/10 hover:text-destructive group-hover:opacity-100"
             >
               <Trash2 className="h-3.5 w-3.5" />

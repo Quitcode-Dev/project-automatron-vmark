@@ -34,6 +34,7 @@ Web UI (from `web-ui/`):
 
 - Env in `.env` at project root: `GITHUB_TOKEN`, `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GITHUB_WEBHOOK_SECRET`. `pydantic-settings` reads `.env` from **CWD** — symlink `.env` if running from a subdirectory.
 - DB: SQLite, `config.py` default `./data/automatron.db` (relative to CWD).
+- **Projects are per-user.** `projects.owner_id` → `users.id` (`models/user.py`); access is owner, `project_members` row, or admin (`AUTOMATRON_ADMIN_EMAILS`). `require_project_access` is registered **once** on the `include_router` in `main.py` and 404s any project-scoped route the caller doesn't own — it keys off `{project_id}`, and off `{target_id}`/`{plan_id}`/`{run_id}` by resolving them to their project, so new endpoints are covered automatically with no per-route check. Socket.IO is *not* scoped yet (any authenticated client can join any project room).
 - **FastAPI `BackgroundTasks` silently swallows exceptions** — when "nothing happens," check `activity_logs` in SQLite.
 - `call_llm()` takes a `[SystemMessage(...), HumanMessage(...)]` list, not a `system=` kwarg (verify against current `llm/` code before relying on this — memory note).
 - Commit/push only when asked; branch first if on `main`.
