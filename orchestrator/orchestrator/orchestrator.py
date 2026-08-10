@@ -63,14 +63,21 @@ def _parse_tagged_block(response: str, tag: str) -> str | None:
 
 def _parse_repo_url(repo_url: str) -> tuple[str, str] | None:
     """Extract (owner, repo) from a GitHub URL or owner/repo string."""
+    # NB: removesuffix, never rstrip — rstrip(".git") treats its argument as a
+    # CHARACTER SET, so it eats any trailing '.', 'g', 'i' or 't':
+    # "…-training" -> "…-trainin", "toolkit" -> "toolk", "digit" -> "d".
+    # That truncated name was persisted to projects.github_repo_name and every
+    # GitHub call 404'd. See tests/test_parse_repo_url.py.
     # https://github.com/owner/repo  or  github.com/owner/repo
     match = re.search(r"github\.com/([^/]+)/([^/?\s#]+)", repo_url)
     if match:
-        return match.group(1), match.group(2).rstrip(".git")
+        repo = match.group(2).removesuffix(".git")
+        return (match.group(1), repo) if repo else None
     # owner/repo shorthand
     parts = repo_url.strip().split("/")
     if len(parts) == 2 and parts[0] and parts[1]:
-        return parts[0], parts[1].rstrip(".git")
+        repo = parts[1].removesuffix(".git")
+        return (parts[0], repo) if repo else None
     return None
 
 
