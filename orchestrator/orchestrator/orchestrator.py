@@ -81,6 +81,37 @@ def _parse_repo_url(repo_url: str) -> tuple[str, str] | None:
     return None
 
 
+# Per-file caps for the docs the architect plans from, by directory depth.
+# These are a guard against a pathological repo, NOT a budget to ration normal
+# specs against: the context window is 1M tokens, and a real PRD runs to tens of
+# KB. The previous 8000/4000/2000 caps discarded 70% of a 27KB PRD and 52% of a
+# 17KB Charter — the two documents that actually define the product — while the
+# small epic/story files passed through whole.
+_DOC_CHARS_TOP = 64_000      # repo root *.md and docs/*.md — the primary specs
+_DOC_CHARS_NESTED = 32_000   # docs/<dir>/*.md — epics, stories
+_DOC_CHARS_DEEP = 16_000     # docs/<dir>/<dir>/*.md
+# Aggregate ceiling across every doc, so a repo with hundreds of files cannot
+# blow up one request. Reaching it is reported to the user, never silent.
+_DOC_CHARS_TOTAL = 400_000
+
+
+def _format_doc(path: str, text: str, max_chars: int) -> str:
+    """Render one doc for the architect prompt, marking truncation explicitly.
+
+    A silently truncated document is indistinguishable, to the model, from one
+    that simply ends mid-sentence — so it plans from the fragment as though it
+    were the whole spec. Say so instead.
+    """
+    body = text[:max_chars]
+    marker = ""
+    if len(text) > max_chars:
+        marker = (
+            f"\n\n[TRUNCATED: showing the first {max_chars:,} of {len(text):,} "
+            f"characters of {path}. The rest of this document was not included.]"
+        )
+    return f"\n\n---\n## {path}\n\n{body}{marker}"
+
+
 def _read_source_files(repo_dir: "Path", max_chars: int = 40000) -> str:
     """Walk repo_dir and return key source files as a formatted string."""
     import os as _os
@@ -835,40 +866,57 @@ class GitHubOrchestrator:
             readme = await self.gh.read_file(owner, repo, "README.md") or readme
 
         # Auto-discover docs — scan root + docs/ folder, read all .md files up to 3 levels deep
-        docs_content = ""
+        docs_parts: list[str] = []
         docs_files_read: list[str] = []
+        docs_skipped: list[str] = []
+        docs_total = 0
+
+        def _add_doc(path: str, text: str, cap: int) -> None:
+            """Append one doc, honouring the aggregate ceiling. Never drops silently."""
+            nonlocal docs_total
+            if not text:
+                return
+            if docs_total >= _DOC_CHARS_TOTAL:
+                docs_skipped.append(path)
+                return
+            rendered = _format_doc(path, text, cap)
+            docs_parts.append(rendered)
+            docs_total += len(rendered)
+            docs_files_read.append(path)
+
         root_entries = await self.gh.list_directory(owner, repo, "")
         docs_entries = await self.gh.list_directory(owner, repo, "docs")
         # Root-level .md files (excluding README, already captured above)
         for entry in root_entries:
             if entry.get("type") == "file" and entry["name"].endswith(".md") and entry["name"] != "README.md":
                 text = await self.gh.read_file(owner, repo, entry["path"]) or ""
-                if text:
-                    docs_content += f"\n\n---\n## {entry['name']}\n\n{text[:8000]}"
-                    docs_files_read.append(entry["path"])
+                _add_doc(entry["path"], text, _DOC_CHARS_TOP)
         for entry in docs_entries:
             if entry.get("type") == "file" and entry["name"].endswith(".md"):
                 text = await self.gh.read_file(owner, repo, entry["path"]) or ""
-                if text:
-                    docs_content += f"\n\n---\n## {entry['name']}\n\n{text[:8000]}"
-                    docs_files_read.append(entry["path"])
+                _add_doc(entry["path"], text, _DOC_CHARS_TOP)
             elif entry.get("type") == "dir":
                 sub_entries = await self.gh.list_directory(owner, repo, entry["path"])
                 for sub in sub_entries:
                     if sub.get("type") == "file" and sub["name"].endswith(".md"):
                         text = await self.gh.read_file(owner, repo, sub["path"]) or ""
-                        if text:
-                            docs_content += f"\n\n---\n## {sub['path']}\n\n{text[:4000]}"
-                            docs_files_read.append(sub["path"])
+                        _add_doc(sub["path"], text, _DOC_CHARS_NESTED)
                     elif sub.get("type") == "dir":
                         # One more level (e.g. docs/user-stories/E-001/)
                         deep_entries = await self.gh.list_directory(owner, repo, sub["path"])
                         for deep in deep_entries:
                             if deep.get("type") == "file" and deep["name"].endswith(".md"):
                                 text = await self.gh.read_file(owner, repo, deep["path"]) or ""
-                                if text:
-                                    docs_content += f"\n\n---\n## {deep['path']}\n\n{text[:2000]}"
-                                    docs_files_read.append(deep["path"])
+                                _add_doc(deep["path"], text, _DOC_CHARS_DEEP)
+
+        docs_content = "".join(docs_parts)
+        if docs_skipped:
+            await self._log(
+                f"{len(docs_skipped)} doc(s) not sent to the architect",
+                f"Aggregate doc budget ({_DOC_CHARS_TOTAL:,} chars) reached. Skipped: "
+                + ", ".join(docs_skipped),
+                "AMBIGUITY",
+            )
 
         extra_context = docs_content
 
