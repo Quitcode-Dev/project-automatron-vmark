@@ -97,6 +97,34 @@ class UsageTotals:
 
 _READ_BUDGET = 80_000  # max chars per read — protect the context window
 
+# Directories that must never be staged, matched by path prefix. Mirrors
+# RepositoryManager._ensure_gitignore's entries — the builder clones directly
+# and so never benefits from that method, and a spec-only repo (docs, no code)
+# ships no .gitignore of its own.
+_ARTIFACT_DIRS: tuple[str, ...] = (
+    "node_modules/", ".next/", "dist/", "build/", ".venv/", "venv/",
+    "__pycache__/", ".turbo/", "coverage/", ".pytest_cache/", ".mypy_cache/",
+)
+
+
+def _ensure_builder_gitignore(repo_dir: Path) -> None:
+    """Append the artifact directories to the clone's .gitignore, creating it if absent.
+
+    Additive: existing entries are preserved and nothing is rewritten, so a repo
+    that already ignores these is left untouched.
+    """
+    gitignore = repo_dir / ".gitignore"
+    try:
+        existing = gitignore.read_text(encoding="utf-8") if gitignore.exists() else ""
+        lines = [line.strip() for line in existing.splitlines() if line.strip()]
+        missing = [d for d in (*_ARTIFACT_DIRS, ".env") if d not in lines]
+        if missing:
+            gitignore.write_text("\n".join([*lines, *missing]) + "\n", encoding="utf-8")
+    except OSError as exc:
+        # Never fail the run over this — the prefix filter in the staging step is
+        # the load-bearing guard; the file is the convenience.
+        logger.warning("Agent SDK: could not write .gitignore in %s: %s", repo_dir, exc)
+
 
 def _safe_path(repo_dir: Path, rel: str) -> Path | None:
     """Resolve a relative path inside repo_dir; reject escapes."""
@@ -489,6 +517,14 @@ async def implement_issue_via_agent_sdk(
         await _run(["git", "checkout", "-B", branch], cwd=repo_dir)
         await _run(["git", "clean", "-fd"], cwd=repo_dir)
 
+    # The builder clones directly rather than going through RepositoryManager, so
+    # RepositoryManager._ensure_gitignore never ran on this working copy. Without
+    # it, `npm install` leaves node_modules/ untracked, staging picks it up, and
+    # the push is rejected — GitHub caps a single file at 100 MB and
+    # next-swc.linux-arm64-musl.node alone is ~134 MB. Spec-only repos (docs, no
+    # code) ship no .gitignore of their own, which is exactly where this bites.
+    _ensure_builder_gitignore(repo_dir)
+
     # Build the user message — issue body + optional primary-directive framing
     if extra_context:
         user_message = (
@@ -653,7 +689,16 @@ async def implement_issue_via_agent_sdk(
         parts = line.split(None, 1)
         if len(parts) == 2:
             changed_paths.append(parts[1])
-    meaningful = [p for p in changed_paths if p not in _BUILD_ARTIFACTS and not p.startswith(".next/")]
+    # Belt and braces with the .gitignore written at clone time: even if a repo
+    # ships its own .gitignore that omits these, staging must never pick up a
+    # dependency or build directory. `git status --porcelain` collapses an
+    # untracked directory to a single entry with a trailing slash ("node_modules/"),
+    # so a prefix test catches both the collapsed form and individual paths.
+    meaningful = [
+        p for p in changed_paths
+        if p not in _BUILD_ARTIFACTS
+        and not any(p.startswith(d) for d in _ARTIFACT_DIRS)
+    ]
     if not meaningful:
         logger.warning(
             "Agent SDK: only build artifacts changed for issue #%d — skipping commit/push. Artifacts: %s",
@@ -677,7 +722,23 @@ async def implement_issue_via_agent_sdk(
          "commit", "-m", f"feat: implement #{issue_number} via Agent SDK\n\n{done_summary or ''}"],
         cwd=repo_dir,
     )
-    if rc != 0 and "nothing to commit" not in out.lower():
+    if rc != 0:
+        if "nothing to commit" in out.lower():
+            # Previously this fell through to push, producing a branch identical to
+            # its base. The run reported success, and the caller's PR attempt then
+            # died on a 422 ("No commits between main and <branch>") two steps
+            # later, with the real cause — nothing was committed — nowhere in the
+            # log. Fail here, where we still know why.
+            logger.warning(
+                "Agent SDK: nothing staged for issue #%d after selecting %s — no branch pushed",
+                issue_number, meaningful,
+            )
+            return None, (
+                f"Agent called done but nothing was committed. Files git reported as "
+                f"changed: {meaningful or 'none'}. No branch was pushed. The agent may "
+                f"have declared completion without editing anything, or written only "
+                f"to ignored paths."
+            ), usage
         return None, f"commit failed: {out[-500:]}", usage
 
     rc, out = await _run(

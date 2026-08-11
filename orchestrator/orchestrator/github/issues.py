@@ -117,7 +117,11 @@ class GitHubClient:
                     if m["title"] == title:
                         return m["number"]
                 raise RuntimeError(f"Milestone '{title}' returned 422 but was not found")
-            response.raise_for_status()
+            if response.status_code not in {200, 201}:
+                raise RuntimeError(
+                    f"Failed to create milestone '{title}' on {owner}/{repo}: "
+                    f"{response.status_code} {response.text}"
+                )
             return response.json()["number"]
 
     async def list_milestones(self, owner: str, repo: str) -> list[dict[str, Any]]:
@@ -164,7 +168,15 @@ class GitHubClient:
 
         async with self._client(timeout=30.0) as client:
             response = await client.post(f"/repos/{owner}/{repo}/issues", json=payload)
-            response.raise_for_status()
+            if response.status_code not in {200, 201}:
+                # A 410 here means "Issues are disabled for this repo" — GitHub says
+                # so in the body, and the default for a FORK is disabled. Without
+                # this the activity log shows only "Client error '410 Gone' for url
+                # ...", which reads as a mystery rather than a one-click setting.
+                raise RuntimeError(
+                    f"Failed to create issue '{title}' on {owner}/{repo}: "
+                    f"{response.status_code} {response.text}"
+                )
             return response.json()
 
     async def trigger_copilot_agent(
@@ -222,7 +234,16 @@ class GitHubClient:
                 f"/repos/{owner}/{repo}/pulls",
                 json={"title": title, "body": body, "head": head, "base": base},
             )
-            response.raise_for_status()
+            if response.status_code not in {200, 201}:
+                # httpx's message is status + URL only. GitHub's body carries the
+                # actionable sentence — a 422 here says "No commits between
+                # <base> and <head>" or "A pull request already exists" — and
+                # bare raise_for_status() throws it away, which is what makes
+                # these failures unreadable in the activity log.
+                raise RuntimeError(
+                    f"Failed to open PR {head} -> {base} on {owner}/{repo}: "
+                    f"{response.status_code} {response.text}"
+                )
             return response.json()
 
     # ── Pull Requests ─────────────────────────────────────────────────────────
